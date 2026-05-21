@@ -3,7 +3,7 @@ USER root
 WORKDIR /opt/runners/task-runner-python
 
 # Copy the requirements file from your git repo into the container
-COPY requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 USER runner
