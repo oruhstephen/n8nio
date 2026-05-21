@@ -1,4 +1,4 @@
 FROM n8nio/runners:latest
 USER root
-RUN cd/opt/runners/task-runner-python && uv pip install numpy 
+RUN cd/opt/runners/task-runner-python && pip install websockets
 USER runner
