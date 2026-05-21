@@ -6,7 +6,7 @@ WORKDIR /opt/runners/task-runner-python
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client finnhub-python polars \
     scipy matplotlib seaborn plotly streamlit \
-    statsmodels xgboost
+    statsmodels
 
 
 USER runner
