@@ -1,4 +1,5 @@
 FROM n8nio/runners:latest
 USER root
-RUN cd/opt/runners/task-runner-python 
+WORKDIR /opt/runners/task-runner-python
+RUN pip install websockets
 USER runner
