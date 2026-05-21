@@ -3,6 +3,6 @@ USER root
 WORKDIR /opt/runners/task-runner-python
 
 # Add all the packages you need here, separated by spaces
-RUN pip install websockets requests pandas numpy yfinance
+RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client
 
 USER runner
