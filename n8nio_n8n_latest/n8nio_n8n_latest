@@ -5,10 +5,23 @@ WORKDIR /opt/runners/task-runner-python
 # Add all the packages you need here, separated by spaces
 RUN apt-get update && apt-get install -y python3 python3-pip python3-venv
 RUN python3 -m venv /opt/venv
-RUN /opt/venv/bin/pip install --no-cache-dir websockets pandas numpy requests finnhub-python polars \
+
+
+# 3. Use 'apk' (Alpine's package manager) to install Python and the C-build tools
+RUN apk add --no-cache python3 py3-pip python3-dev build-base gcc g++ musl-dev
+
+# 4. Create a virtual environment
+RUN python3 -m venv /opt/venv
+
+# 5. Use the virtual environment to install your data pipeline packages
+RUN /opt/venv/bin/pip install --no-cache-dir websockets pandas numpy requests finnhub-python polars\
     scipy matplotlib seaborn plotly streamlit scikit-learn \
     statsmodels xgboost
+
+# 6. Make the virtual environment the default for the container
 ENV PATH="/opt/venv/bin:$PATH"
+
+# 7. Switch back to the default non-root user for security
 USER node
 
 USER runner
