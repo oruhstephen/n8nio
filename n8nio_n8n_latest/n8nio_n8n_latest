@@ -2,24 +2,13 @@ FROM n8nio/runners:latest
 USER root
 WORKDIR /opt/runners/task-runner-python
 
-# 1. Update, install, and clean up apt cache in a single layer to reduce image size
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip python3-venv && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# 2. Create the virtual environment and install Python packages
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir \
-    websockets pandas numpy requests finnhub-python polars \
+# Add all the packages you need here, separated by spaces
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv
+RUN python3 -m venv /opt/venv
+RUN /opt/venv/bin/pip install --no-cache-dir websockets pandas numpy requests finnhub-python polars \
     scipy matplotlib seaborn plotly streamlit scikit-learn \
-    statsmodels xgboost notebook
-
-# 3. Ensure the unprivileged user has correct permissions for the venv
-RUN chown -R node:node /opt/venv
-
-# 4. Add the virtual environment to the PATH
+    statsmodels xgboost
 ENV PATH="/opt/venv/bin:$PATH"
-
-# 5. Switch to the unprivileged user for security (n8n images typically use 'node')
 USER node
+
+USER runner
