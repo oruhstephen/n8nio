@@ -1,5 +1,9 @@
 FROM n8nio/runners:latest
 USER root
 WORKDIR /opt/runners/task-runner-python
-RUN pip install websockets
+
+# Copy the requirements file from your git repo into the container
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 USER runner
