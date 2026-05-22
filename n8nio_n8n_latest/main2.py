@@ -4,7 +4,7 @@ import requests
 import time
 
 FINNHUB_TOKEN = "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g"
-N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook-test/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
+N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
 
 # Add your symbols here (keep under 40 for optimal WebSocket performance)
 WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "MSFT", "PLTR"]
