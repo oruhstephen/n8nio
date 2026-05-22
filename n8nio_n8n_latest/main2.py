@@ -4,7 +4,7 @@ import requests
 import time
 
 FINNHUB_TOKEN = "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g"
-N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
+N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook-test/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
 
 # The symbols you want to monitor (Finnhub standard tier usually allows up to 50 WS subscriptions)
 WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "MSFT", "PLTR"]
