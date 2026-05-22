@@ -1,3 +1,6 @@
 websockets
 requests
 pandas
+websocket-client
+Finnhub-python
+numpy
