@@ -127,9 +127,20 @@ def on_open(ws):
 
 if __name__ == "__main__":
     websocket.enableTrace(False)
-    ws = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
-                              on_open=on_open,
-                              on_message=on_message,
-                              on_error=on_error,
-                              on_close=on_close)
-    ws.run_forever()
+    
+    # We wrap the WebSocket in an infinite loop so the script never actually "dies"
+    while True:
+        print("Connecting to Finnhub WebSocket...")
+        ws = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
+                                  on_open=on_open,
+                                  on_message=on_message,
+                                  on_error=on_error,
+                                  on_close=on_close)
+        
+        # This command blocks the script and keeps it running until the connection drops
+        ws.run_forever()
+        
+        # If the code reaches this line, it means the WebSocket dropped!
+        # We wait 15 seconds so Finnhub has time to clear the ghost connection
+        print("Connection dropped! Waiting 15 seconds before reconnecting...")
+        time.sleep(15)
