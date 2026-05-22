@@ -88,7 +88,7 @@ def on_message(ws, message):
                 # THE LOGIC GATE
                 # NOTE: For testing purposes, Volume is temporarily lowered to 1,000 so it actually triggers.
                 # Once you confirm it reaches n8n, change 1000 back to 3000000.
-                if p_change >= 3.0 and cum_vol >= 3000000 and mkt_cap >= 30:
+                if p_change >= 3.0 and cum_vol >= 1000 and mkt_cap >= 30:
                     avg_price = metrics["total_dollar_traded"] / cum_vol if cum_vol > 0 else metrics["current_price"]
                     
                     qualified_symbols.append({
