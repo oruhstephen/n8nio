@@ -7,7 +7,7 @@ FINNHUB_TOKEN = "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g"
 N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
 
 # Add your symbols here (keep under 40 for optimal WebSocket performance)
-WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "MSFT", "PLTR"]
+WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "MSFT", "PLTR", "EDSA", "NXXT", "RGTI", "SIVEF", "SPCE", "QBTS", "INFQ", "XRX", "INDI", "BB", "DELL"]
 
 market_data = {}
 
@@ -88,7 +88,7 @@ def on_message(ws, message):
                 # THE LOGIC GATE
                 # NOTE: For testing purposes, Volume is temporarily lowered to 1,000 so it actually triggers.
                 # Once you confirm it reaches n8n, change 1000 back to 3000000.
-                if p_change >= 3.0 and cum_vol >= 1000 and mkt_cap >= 30:
+                if p_change >= 3.0 and cum_vol >= 3000000 and mkt_cap >= 30:
                     avg_price = metrics["total_dollar_traded"] / cum_vol if cum_vol > 0 else metrics["current_price"]
                     
                     qualified_symbols.append({
