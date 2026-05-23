@@ -5,7 +5,7 @@ WORKDIR /app
 # Copy the requirements file and install dependencies
 # COPY requirements.txt .
 
-RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client finnhub-python         
+RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client finnhub-python yfinance        
 
 # Copy the actual script
 COPY n8nio_n8n_latest/main2.py .
