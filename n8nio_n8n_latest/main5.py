@@ -65,23 +65,23 @@ def get_morning_watchlist():
                     avg_vol_3m = df['Volume'].mean()
                     
                     # --- RSI (14) Math ---
-                    delta = df['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                    rs = gain / loss
+                   # delta = df['Close'].diff()
+                   # gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                   # loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                   # rs = gain / loss
                     
                     # Handle edge cases where loss might be 0
-                    if loss.iloc[-1] == 0:
-                        rsi_14 = 100
-                    else:
-                        rsi_14 = 100 - (100 / (1 + rs.iloc[-1]))
+                  #  if loss.iloc[-1] == 0:
+                    #    rsi_14 = 100
+                    #else:
+                   #     rsi_14 = 100 - (100 / (1 + rs.iloc[-1]))
                     
                     # --- THE HARD LOGIC GATE ---
-                    if percent_change >= 3.0 and avg_vol_3m >= 1000 and current_price > 0 and rsi_14 > 0:
+                    if percent_change >= 3.0 and avg_vol_3m >= 500000 and current_price > 0: #and rsi_14 > 0:
                         qualified_symbols.append({
                             "symbol": sym,
                             "percent_change": percent_change,
-                            "rsi": rsi_14,
+                            #"rsi": rsi_14,
                             "avg_vol": avg_vol_3m,
                             "prev_close": prev_close
                         })
