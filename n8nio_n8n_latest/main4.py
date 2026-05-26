@@ -16,37 +16,35 @@ def get_morning_watchlist():
     print("Loading universe of tickers from local symbols.json...")
     
     try:
-        # 1. READ THE LOCAL JSON FILE
-        with open('symbols.json', 'r') as file:
-            tickers = json.load(file)
+       # 1. READ AND FILTER THE LOCAL JSON FILE
+        with open('USSYMBOLS.json', 'r') as file:
+            raw_data = json.load(file)
             
-        print(f"Successfully loaded {len(tickers)} symbols from file.")
-        print("Downloading 3-month historical data. This will take a few seconds...")
+        all_tickers = []
         
-        # 2. BULK DOWNLOAD DATA
+        # Loop through the JSON and keep only Common Stocks
+        for item in raw_data:
+            if item.get("type") == "Common Stock":
+                all_tickers.append(item["symbol"])
+                
+        print(f"Scanned {len(raw_data)} total assets. Isolated {len(all_tickers)} Common Stocks.")
+        
+        # 2. THE SAFETY SLICE
+        # Finnhub's US Common Stock list still contains ~5,000 to 10,000 tickers.
+        # We MUST slice this list to the first 1,500 to prevent your Easypanel server 
+        # from crashing out of memory and Yahoo from banning your IP!
+        tickers = all_tickers[:1500] 
+        
+        # Clean up formatting for yfinance (e.g., BRK.B becomes BRK-B)
+        tickers = [t.replace('.', '-') for t in tickers]
+        
+        print(f"Executing morning scan on the top {len(tickers)} symbols...")
+        print("Downloading 3-month historical data. This will take 15-30 seconds...")
+        
+        # 3. BULK DOWNLOAD DATA
         data = yf.download(tickers, period="3mo", group_by='ticker', auto_adjust=True, threads=True, progress=False)
-        
-        qualified_symbols = []
-        
-        # 3. CALCULATE METRICS
-        for sym in tickers:
-            try:
-                df = data[sym]
-                if df.empty or len(df) < 15: 
-                    continue
                 
-                current_price = df['Close'].iloc[-1]
-                prev_close = df['Close'].iloc[-2]
-                percent_change = ((current_price - prev_close) / prev_close) * 100
-                avg_vol_3m = df['Volume'].mean()
-                
-                delta = df['Close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                rs = gain / loss
-                rsi_14 = 100 - (100 / (1 + rs.iloc[-1]))
-                
-                # 4. THE LOGIC GATE
+        # 4. THE LOGIC GATE
                 if percent_change >= 3.0 and avg_vol_3m >= 3000000 and current_price > 0 and rsi_14 > 0:
                     qualified_symbols.append({
                         "symbol": sym,
