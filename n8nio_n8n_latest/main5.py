@@ -6,8 +6,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-FINNHUB_TOKEN = "YOUR_FINNHUB_TOKEN_HERE"
-N8N_WEBHOOK_URL = "YOUR_N8N_WEBHOOK_URL_HERE"
+FINNHUB_TOKEN = "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g"
+N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
 
 # ==========================================
 # PHASE 1: THE NATIVE QUANT SCREENER
