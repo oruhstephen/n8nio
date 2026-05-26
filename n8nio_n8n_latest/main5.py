@@ -77,7 +77,7 @@ def get_morning_watchlist():
                         rsi_14 = 100 - (100 / (1 + rs.iloc[-1]))
                     
                     # --- THE HARD LOGIC GATE ---
-                    if percent_change >= 3.0 and avg_vol_3m >= 3000000 and current_price > 0 and rsi_14 > 0:
+                    if percent_change >= 3.0 and avg_vol_3m >= 1000 and current_price > 0 and rsi_14 > 0:
                         qualified_symbols.append({
                             "symbol": sym,
                             "percent_change": percent_change,
