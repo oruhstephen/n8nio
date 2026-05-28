@@ -73,7 +73,8 @@ for target in TODAYS_TARGETS:
         "cumulative_volume": 0,
         "total_dollar_traded": 0,
         "percent_change": 0,
-        "high_of_day_price": 0  # <--- UPGRADED: Added for the 10% upside potential calculation
+        "high_of_day_price": 0,  # <--- UPGRADED: Added for the 10% upside potential calculation
+        "live_volume": 0  # <--- NEW: Added for RVOL calculation
     }
 
 # ==========================================
@@ -140,6 +141,7 @@ def on_message(ws, message):
                             "last_price": metrics["current_price"],
                             "intraday_vwap": round(avg_price, 2),
                             "upside_to_hod": round(upside_potential, 2)
+                            "live_volume": cum_vol  # <--- NEW: Added for RVOL calculation
                         })
             
             # Fire the n8n Webhook if we caught any setups
