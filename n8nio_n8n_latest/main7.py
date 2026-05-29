@@ -140,7 +140,7 @@ def on_message(ws, message):
                             "live_percent_change": round(p_change, 2),
                             "last_price": metrics["current_price"],
                             "intraday_vwap": round(avg_price, 2),
-                            "upside_to_hod": round(upside_potential, 2)
+                            "upside_to_hod": round(upside_potential, 2),
                             "live_volume": cum_vol  # <--- NEW: Added for RVOL calculation
                         })
             
