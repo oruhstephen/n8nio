@@ -8,7 +8,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client finnhub-python yfinance        
 
 # Copy the actual script
-COPY n8nio_n8n_latest/main7.py .
+COPY n8nio_n8n_latest/main8.py .
 
 # Run the script permanently
-CMD ["python", "main7.py"]
+CMD ["python", "main8.py"]
