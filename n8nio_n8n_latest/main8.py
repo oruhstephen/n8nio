@@ -203,3 +203,16 @@ if __name__ == "__main__":
         ws.run_forever(ping_interval=30, ping_timeout=10)
         print("Connection dropped! Reconnecting in 15 seconds...")
         time.sleep(15)
+
+def notify_n8n():
+    n8n_wait_url = "https://go90ng-n8n.eq7icp.easypanel.host/webhook-waiting/1925"
+    try:
+        # We use a quick POST request to tell n8n the app is online
+        requests.post(n8n_wait_url, timeout=5)
+    except Exception as e:
+        print(f"Failed to ping n8n: {e}")
+
+# Run this as a background thread so it doesn't block your main app loop
+threading.Thread(target=notify_n8n).start()
+
+# ... rest of your main app startup ...
