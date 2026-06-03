@@ -23,10 +23,10 @@ def get_morning_watchlist():
         print("Building institutional logic gate...")
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
-            EquityQuery('gte', ['intradaymarketcap', 30000000]),  # $30M+ Market Cap
-            EquityQuery('gt',  ['intradayprice', 0]),              # Price > $0
+            EquityQuery('gte', ['intradaymarketcap', 100000000]),  # $100M+ Market Cap
+            EquityQuery('gt',  ['intradayprice', 1.00]),              # Price > $1
             EquityQuery('gte', ['percentchange', 3.0]),            # +3% Intraday Gain
-            EquityQuery('gte', ['avgdailyvol3m', 500000])          # 500k+ 3-Month Average Vol
+            EquityQuery('gte', ['avgdailyvol3m', 250000])          # 250k+ 3-Month Average Vol
         ])
 
         print("Executing instant query against Yahoo's live servers...")
