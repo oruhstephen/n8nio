@@ -148,7 +148,7 @@ def on_message(ws, message):
                         # --- NEW: DYNAMIC TARGETING CALCULATION ---
                         # Require the upside room to be at least 50% of the morning's total run.
                         # We use max() to enforce a hard 5% minimum floor so we don't take microscopic trades.
-                        dynamic_target = max(5.0, p_change * 0.5)
+                        dynamic_target = max(5.0, p_change * 0.45)
 
                         # --- NEW: WHOLE-DOLLAR CONVERGENCE LOGIC ---
                         # Find the nearest whole number (e.g., $4.98 rounds to $5.00)
