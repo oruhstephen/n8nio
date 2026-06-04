@@ -149,6 +149,18 @@ def on_message(ws, message):
                         # Require the upside room to be at least 50% of the morning's total run.
                         # We use max() to enforce a hard 5% minimum floor so we don't take microscopic trades.
                         dynamic_target = max(5.0, p_change * 0.5)
+
+                        # --- NEW: WHOLE-DOLLAR CONVERGENCE LOGIC ---
+                        # Find the nearest whole number (e.g., $4.98 rounds to $5.00)
+                        nearest_whole_dollar = round(metrics["current_price"])
+                        
+                        # Check if the current price is within 5 cents of that major psychological level
+                        # We only care about this if the price is > $2.00 (penny stocks fluctuate too wildly)
+                        is_converging = False
+                        if metrics["current_price"] > 2.00:
+                            cents_away = abs(metrics["current_price"] - nearest_whole_dollar)
+                            if cents_away <= 0.05:
+                                is_converging = True
                         
                         print(f"[{sym}] +{p_change:.2f}% | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}%")
                         
@@ -161,7 +173,8 @@ def on_message(ws, message):
                                 "intraday_vwap": round(avg_price, 2),
                                 "upside_to_hod": round(upside_potential, 2),
                                 "required_dynamic_target": round(dynamic_target, 2),
-                                "live_volume": cum_vol  # Uses cum_vol to send to n8n for RVOL calculation
+                                "live_volume": cum_vol,  # Uses cum_vol to send to n8n for RVOL calculation
+                                "whole_dollar_convergence": is_converging
                             })
                 
                 # Fire the n8n Webhook asynchronously to prevent WebSocket freezing
