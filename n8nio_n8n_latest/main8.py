@@ -209,8 +209,3 @@ if __name__ == "__main__":
         ws.run_forever(ping_interval=30, ping_timeout=10)
         print("Connection dropped! Reconnecting in 15 seconds...")
         time.sleep(15)
-
-# Run this as a background thread so it doesn't block your main app loop
-threading.Thread(target=notify_n8n).start()
-
-# ... rest of your main app startup ...
