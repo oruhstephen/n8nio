@@ -153,7 +153,7 @@ def on_message(ws, message):
                         print(f"[{sym}] +{p_change:.2f}% | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}%")
                         
                         # THE 10%+ RUNNER LOGIC GATE
-                        if p_change >= 7.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0:
+                        if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0:
                             triggered_symbols.append({
                                 "symbol": sym,
                                 "live_percent_change": round(p_change, 2),
