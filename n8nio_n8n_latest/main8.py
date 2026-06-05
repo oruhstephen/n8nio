@@ -136,33 +136,43 @@ def on_message(ws, message):
                     p_change = metrics["percent_change"]
                     cum_vol = metrics["cumulative_volume"]
                     hod_price = metrics["high_of_day_price"]
+                    current_price = metrics["current_price"]
+                    price_60s_ago = metrics["price_60s_ago"]
                     
-                    if cum_vol > 50000: 
+                    if cum_vol > 50000 and current_price > 0: 
                         avg_price = metrics["total_dollar_traded"] / cum_vol
-                        vwap_distance = ((metrics["current_price"] - avg_price) / avg_price) * 100
+                        vwap_distance = ((current_price - avg_price) / avg_price) * 100
                         
                         upside_potential = 0
                         if avg_price > 0:
                             upside_potential = ((hod_price - avg_price) / avg_price) * 100
 
                         # --- NEW: DYNAMIC TARGETING CALCULATION ---
-                        # Require the upside room to be at least 50% of the morning's total run.
+                        # Require the upside room to be at least 45% of the morning's total run.
                         # We use max() to enforce a hard 5% minimum floor so we don't take microscopic trades.
                         dynamic_target = max(5.0, p_change * 0.45)
 
                         # --- NEW: WHOLE-DOLLAR CONVERGENCE LOGIC ---
                         # Find the nearest whole number (e.g., $4.98 rounds to $5.00)
-                        nearest_whole_dollar = round(metrics["current_price"])
+                        nearest_whole_dollar = round(current_price)
                         
                         # Check if the current price is within 5 cents of that major psychological level
                         # We only care about this if the price is > $2.00 (penny stocks fluctuate too wildly)
                         is_converging = False
-                        if metrics["current_price"] > 2.00:
-                            cents_away = abs(metrics["current_price"] - nearest_whole_dollar)
+                        if current_price > 2.00:
+                           cents_away = abs(current_price - nearest_whole_dollar)
                             if cents_away <= 0.05:
                                 is_converging = True
+
+                        # --- NEW: FALLING KNIFE FILTER ---
+                        # True if the price has stabilized or bounced in the last 60 seconds
+                        is_bouncing = current_price >= price_60s_ago
+
+                        # --- NEW: STRICT STOP-LOSS CALCULATION ---
+                        # Set the hard exit 2.5% below the VWAP support line
+                        stop_loss_price = avg_price * 0.975
                         
-                        print(f"[{sym}] +{p_change:.2f}% | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}% | Converging: {is_converging}")
+                        print(f"[{sym}] +{p_change:.2f}% | Price: {current_price}| Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}% | Converging: {is_converging} | Bouncing: {is_bouncing}")
                         
                         # THE 10%+ RUNNER LOGIC GATE
                         if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0:
@@ -174,8 +184,15 @@ def on_message(ws, message):
                                 "upside_to_hod": round(upside_potential, 2),
                                 "required_dynamic_target": round(dynamic_target, 2),
                                 "live_volume": cum_vol,  # Uses cum_vol to send to n8n for RVOL calculation
-                                "whole_dollar_convergence": is_converging
+                                "whole_dollar_convergence": is_converging,
+                                "stop_loss_price": round(stop_loss_price, 2)
                             })
+
+                        # --- NEW: UPDATE BOT MEMORY ---
+                # After checking all stocks, save the current prices for the NEXT 60-second check
+                for sym in market_data:
+                    if market_data[sym]["current_price"] > 0:
+                        market_data[sym]["price_60s_ago"] = market_data[sym]["current_price"]
                 
                 # Fire the n8n Webhook asynchronously to prevent WebSocket freezing
                 if triggered_symbols:
