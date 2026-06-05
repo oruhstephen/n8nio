@@ -160,7 +160,7 @@ def on_message(ws, message):
                         # We only care about this if the price is > $2.00 (penny stocks fluctuate too wildly)
                         is_converging = False
                         if current_price > 2.00:
-                           cents_away = abs(current_price - nearest_whole_dollar)
+                            cents_away = abs(current_price - nearest_whole_dollar)
                             if cents_away <= 0.05:
                                 is_converging = True
 
