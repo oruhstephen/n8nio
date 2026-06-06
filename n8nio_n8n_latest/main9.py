@@ -39,13 +39,22 @@ def get_morning_watchlist():
             sym = quote.get("symbol")
             prev_close = quote.get("regularMarketPreviousClose", 0)
             live_change = quote.get("regularMarketChangePercent", 0)
+            day_volume = quote.get("regularMarketVolume", 0)
+
+            # --- NEW: MACRO TREND CALCULATION ---
+            fifty_day_avg = quote.get("fiftyDayAverage", 0)
             
             # --- SEED DATA FOR LATE-START VWAP & HOD ---
             day_high = quote.get("regularMarketDayHigh", 0)
             day_low = quote.get("regularMarketDayLow", 0)
             current_price = quote.get("regularMarketPrice", 0)
             day_volume = quote.get("regularMarketVolume", 0)
-            
+
+            # If today's price is higher than the 50-day average, the macro trend is Bullish.
+            macro_uptrend = False
+            if current_price > fifty_day_avg and fifty_day_avg > 0:
+                macro_uptrend = True
+                
             # Approximate the morning's Total Dollar Traded using the Typical Price formula
             typical_price = current_price
             if (day_high + day_low + current_price) > 0:
@@ -60,7 +69,8 @@ def get_morning_watchlist():
                 "prev_close": prev_close,
                 "day_high": day_high,
                 "day_volume": day_volume,
-                "seed_dollar_traded": seed_dollar_traded
+                "seed_dollar_traded": seed_dollar_traded,
+                "macro_uptrend": macro_uptrend
             })
             
         top_40 = qualified_symbols[:40]
@@ -89,7 +99,9 @@ for target in TODAYS_TARGETS:
         "total_dollar_traded": target.get("seed_dollar_traded", 0), 
         "percent_change": 0,
         "high_of_day_price": target.get("day_high", 0),             
-        "price_60s_ago": target.get("regularMarketPrice", 0)        # FIXED: Bot memory initialization
+        "price_60s_ago": target.get("regularMarketPrice", 0),        # FIXED: Bot memory initialization
+        "price_60s_ago": target.get("regularMarketPrice", 0),
+        "macro_uptrend": target.get("macro_uptrend", False)
     }
 
 # ==========================================
@@ -180,7 +192,8 @@ def on_message(ws, message):
                                 "required_dynamic_target": round(dynamic_target, 2),
                                 "live_volume": cum_vol,
                                 "whole_dollar_convergence": is_converging,
-                                "stop_loss_price": round(stop_loss_price, 2)
+                                "stop_loss_price": round(stop_loss_price, 2),
+                                "daily_macro_uptrend": metrics["macro_uptrend"]
                             })
 
                 # --- NEW: UPDATE BOT MEMORY ---
