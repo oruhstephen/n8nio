@@ -7,6 +7,7 @@ import sys
 import pandas as pd
 import yfinance as yf
 from yfinance import EquityQuery
+from datetime import datetime
 
 # ==========================================
 # CONFIGURATION
@@ -166,8 +167,12 @@ def on_message(ws, message):
             if current_time - last_n8n_trigger >= 60:
                 last_n8n_trigger = current_time
                 triggered_symbols = []
+
+                # --- NEW: TIMESTAMP GENERATOR ---
+                # Formats the time as HH:MM:SS (e.g., 09:45:30)
+                timestamp_str = datetime.now().strftime("%H:%M:%S")
                 
-                print("\n--- 60 SECOND VWAP EXPLOSION CHECK ---")
+                print("\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
                 
                 for sym, metrics in market_data.items():
                     p_change = metrics["percent_change"]
