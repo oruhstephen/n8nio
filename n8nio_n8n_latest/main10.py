@@ -227,7 +227,8 @@ def on_message(ws, message):
                                 "stop_loss_price": round(stop_loss_price, 2),
                                 "daily_alignment_state": alignment,
                                 "extension_from_5ma": round(extension_pct, 2),
-                                "is_over_extended": is_over_extended
+                                "is_over_extended": is_over_extended,
+                                "DateTime":timestamp_str
                             })
 
                 for sym in market_data:
