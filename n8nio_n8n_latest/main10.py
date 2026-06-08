@@ -170,7 +170,7 @@ def on_message(ws, message):
 
                 # --- NEW: TIMESTAMP GENERATOR ---
                 # Formats the time as HH:MM:SS (e.g., 09:45:30)
-                timestamp_str = datetime.now().strftime("%H:%M:%S")
+                timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
                 print("\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
                 
