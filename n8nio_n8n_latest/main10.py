@@ -205,7 +205,7 @@ def on_message(ws, message):
                             if extension_pct >= 50.0:
                                 is_over_extended = True
                         
-                        print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | Danger: {is_over_extended} | Converging: {is_converging} | Bouncing: {is_bouncing} | VWAPDist: {vwap_distance:.2f}% | Upside2HOD: {upside_potential:.2f}% | T.Needed: {dynamic_target:.2f}%")
+                        print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | Danger: {is_over_extended} | Converge: {is_converging} | Bounce: {is_bouncing} | VWAPDist: {vwap_distance:.2f}% | Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}%")
                         
                         if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0 and is_bouncing:
                             triggered_symbols.append({
