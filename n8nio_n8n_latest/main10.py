@@ -172,7 +172,7 @@ def on_message(ws, message):
                 # Formats the time as HH:MM:SS (e.g., 09:45:30)
                 timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                print("\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
+                print(f"\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
                 
                 for sym, metrics in market_data.items():
                     p_change = metrics["percent_change"]
