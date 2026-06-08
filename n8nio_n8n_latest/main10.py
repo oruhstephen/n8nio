@@ -8,6 +8,7 @@ import pandas as pd
 import yfinance as yf
 from yfinance import EquityQuery
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # CONFIGURATION
@@ -170,7 +171,8 @@ def on_message(ws, message):
 
                 # --- NEW: TIMESTAMP GENERATOR ---
                 # Formats the time as HH:MM:SS (e.g., 09:45:30)
-                timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                uk_time = datetime.now(ZoneInfo("Europe/London"))
+                timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
                 
                 print(f"\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
                 
