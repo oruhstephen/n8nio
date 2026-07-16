@@ -6,6 +6,8 @@ import threading
 import sys
 import yfinance as yf
 from yfinance import EquityQuery
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # CONFIGURATION
@@ -101,7 +103,12 @@ for target in TODAYS_TARGETS:
         "high_of_day_price": target.get("day_high", 0),             
         "price_60s_ago": target.get("regularMarketPrice", 0),        # FIXED: Bot memory initialization
         "price_60s_ago": target.get("regularMarketPrice", 0),
-        "macro_uptrend": target.get("macro_uptrend", False)
+        "macro_uptrend": target.get("macro_uptrend", False),
+
+        # --- NEW: ORDER FLOW TRACKING ---
+        "prev_tick_price": target.get("regularMarketPrice", 0),
+        "rolling_buy_vol": 0,
+        "rolling_sell_vol": 0
     }
 
 # ==========================================
@@ -132,6 +139,17 @@ def on_message(ws, message):
                     if price > market_data[sym]["high_of_day_price"]:
                         market_data[sym]["high_of_day_price"] = price
                     
+                    # --- NEW: THE ORDER FLOW TICK TEST ---
+                    prev_tick = market_data[sym]["prev_tick_price"]
+                    if prev_tick > 0:
+                        if price > prev_tick:
+                            market_data[sym]["rolling_buy_vol"] += vol  # Aggressive Ask Slap
+                        elif price < prev_tick:
+                            market_data[sym]["rolling_sell_vol"] += vol # Aggressive Bid Hit
+                    
+                    # Save this tick's price for the next comparison
+                    market_data[sym]["prev_tick_price"] = price
+                    
                     # 3. Calculate Live Percent Change
                     prev_close = market_data[sym]["prev_close"]
                     if prev_close > 0:
@@ -142,8 +160,12 @@ def on_message(ws, message):
             if current_time - last_n8n_trigger >= 60:
                 last_n8n_trigger = current_time
                 triggered_symbols = []
+
+                # Format timestamps locally to UK Time
+                uk_time = datetime.now(ZoneInfo("Europe/London"))
+                timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
                 
-                print("\n--- 60 SECOND VWAP EXPLOSION CHECK ---")
+                print(f"\n--- {timestamp_str} | 60 SECOND VWAP EXPLOSION CHECK ---")
                 
                 for sym, metrics in market_data.items():
                     p_change = metrics["percent_change"]
@@ -178,8 +200,22 @@ def on_message(ws, message):
 
                         # --- NEW: STRICT STOP-LOSS CALCULATION ---
                         stop_loss_price = avg_price * 0.975
+
+                        # --- NEW: 60-SECOND ORDER FLOW DELTA ---
+                        buy_v = metrics["rolling_buy_vol"]
+                        sell_v = metrics["rolling_sell_vol"]
+                        total_tick_vol = buy_v + sell_v
                         
-                        print(f"[{sym}] +{p_change:.2f}% | Price: {current_price:.2f} | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}% | Converging: {is_converging} | Bouncing: {is_bouncing}")
+                        order_flow_delta_pct = 0.0
+                        if total_tick_vol > 0:
+                            # Formula: (Buys - Sells) / Total * 100
+                            order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100
+                            
+                        # Reset the rolling volumes for the next 60-second window
+                        market_data[sym]["rolling_buy_vol"] = 0
+                        market_data[sym]["rolling_sell_vol"] = 0
+                        
+                        print(f"[{sym}] +{p_change:.2f}% | Price: {current_price:.2f} | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}% | Converging: {is_converging} | Delta: {order_flow_delta_pct:.2f}% | Bouncing: {is_bouncing}")
                         
                         # THE DYNAMIC RUNNER LOGIC GATE
                         if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0 and is_bouncing:
@@ -193,7 +229,8 @@ def on_message(ws, message):
                                 "live_volume": cum_vol,
                                 "whole_dollar_convergence": is_converging,
                                 "stop_loss_price": round(stop_loss_price, 2),
-                                "daily_macro_uptrend": metrics["macro_uptrend"]
+                                "daily_macro_uptrend": metrics["macro_uptrend"],
+                                "order_flow_delta_1m": round(order_flow_delta_pct, 2)
                             })
 
                 # --- NEW: UPDATE BOT MEMORY ---
