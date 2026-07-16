@@ -4,6 +4,7 @@ import requests
 import time
 import threading
 import sys
+import pandas as pd
 import yfinance as yf
 from yfinance import EquityQuery
 from datetime import datetime
@@ -41,29 +42,24 @@ def get_morning_watchlist():
             sym = quote.get("symbol")
             prev_close = quote.get("regularMarketPreviousClose", 0)
             live_change = quote.get("regularMarketChangePercent", 0)
-            day_volume = quote.get("regularMarketVolume", 0)
-
-            # --- NEW: MACRO TREND CALCULATION ---
-            fifty_day_avg = quote.get("fiftyDayAverage", 0)
             
-            # --- SEED DATA FOR LATE-START VWAP & HOD ---
             day_high = quote.get("regularMarketDayHigh", 0)
             day_low = quote.get("regularMarketDayLow", 0)
             current_price = quote.get("regularMarketPrice", 0)
             day_volume = quote.get("regularMarketVolume", 0)
+            fifty_day_avg = quote.get("fiftyDayAverage", 0) # Used for Alignment
 
             # If today's price is higher than the 50-day average, the macro trend is Bullish.
             macro_uptrend = False
             if current_price > fifty_day_avg and fifty_day_avg > 0:
                 macro_uptrend = True
-                
-            # Approximate the morning's Total Dollar Traded using the Typical Price formula
+            
             typical_price = current_price
             if (day_high + day_low + current_price) > 0:
                 typical_price = (day_high + day_low + current_price) / 3
                 
             seed_dollar_traded = typical_price * day_volume
-            
+
             print(f" -> [MATCH] {sym} | +{live_change:.2f}% | Seed Vol: {day_volume}")
             
             qualified_symbols.append({
@@ -72,25 +68,65 @@ def get_morning_watchlist():
                 "day_high": day_high,
                 "day_volume": day_volume,
                 "seed_dollar_traded": seed_dollar_traded,
+                "fifty_day_avg": fifty_day_avg,
                 "macro_uptrend": macro_uptrend
             })
             
         top_40 = qualified_symbols[:40]
+        
+        # ==========================================
+        # BATCH DOWNLOAD: ALIGNMENT & GRAVITY CALC
+        # ==========================================
+        print(f"\nDownloading 2-month history for {len(top_40)} symbols to calculate Alignments, Over-Extension and high-momentum matches...")
+        sym_list = [t["symbol"] for t in top_40]
+        
+        if sym_list:
+            hist_data = yf.download(sym_list, period="2mo", progress=False)
+            closes = hist_data['Close'] if 'Close' in hist_data else hist_data
+                
+            for target in top_40:
+                sym = target["symbol"]
+                target["ma_5"] = 0.0 
+                target["alignment_state"] = "MIXED"
+                
+                try:
+                    stock_closes = closes.dropna() if len(sym_list) == 1 else closes[sym].dropna()
+                    
+                    if len(stock_closes) >= 21:
+                        # Calculate all required moving averages
+                        ma_5 = stock_closes.tail(5).mean()
+                        ma_10 = stock_closes.tail(10).mean()
+                        ma_21 = stock_closes.tail(21).mean()
+                        ma_50 = target.get("fifty_day_avg", 0)
+                        
+                        target["ma_5"] = ma_5
+                        
+                        # Calculate Alignment State
+                        if ma_50 > 0:
+                            if ma_10 > ma_21 and ma_21 > ma_50:
+                                target["alignment_state"] = "FULL_BULLISH"
+                            elif ma_10 < ma_21 and ma_21 < ma_50:
+                                target["alignment_state"] = "BEARISH"
+                            else:
+                                min_ma = min(ma_10, ma_21, ma_50)
+                                max_ma = max(ma_10, ma_21, ma_50)
+                                if ((max_ma - min_ma) / min_ma) <= 0.02:
+                                    target["alignment_state"] = "COMPRESSION"
+                                    
+                    print(f" -> [{sym}] Alignment: {target['alignment_state']} | 5-MA: ${target['ma_5']:.2f}")
+                except Exception:
+                    print(f" -> [{sym}] MA calculation failed. Defaulting to safe values.")
+        
         print(f"\nFull Market Scan Complete! Found {len(top_40)} high-momentum matches.")
         return top_40
 
     except Exception as e:
         print(f"API screener failed: {e}")
-        print("CRITICAL: Screener failed to build watchlist. Shutting down to protect capital.")
-        sys.exit(1) # Instantly kills the script so it doesn't trade on fake data
+        sys.exit(1)
 
-# Boot up the watchlist
 TODAYS_TARGETS = get_morning_watchlist()
-
-# Finnhub requires the dot format (BRK.B instead of BRK-B)
 WATCHLIST = [target["symbol"].replace('-', '.') for target in TODAYS_TARGETS]
 
-# Set up the live tracking dictionary with seeded values
 market_data = {}
 for target in TODAYS_TARGETS:
     sym = target["symbol"].replace('-', '.')
@@ -101,14 +137,16 @@ for target in TODAYS_TARGETS:
         "total_dollar_traded": target.get("seed_dollar_traded", 0), 
         "percent_change": 0,
         "high_of_day_price": target.get("day_high", 0),             
-        "price_60s_ago": target.get("regularMarketPrice", 0),        # FIXED: Bot memory initialization
         "price_60s_ago": target.get("regularMarketPrice", 0),
+        "ma_5": target.get("ma_5", 0.0), 
+        "alignment_state": target.get("alignment_state", "MIXED"),
         "macro_uptrend": target.get("macro_uptrend", False),
 
         # --- NEW: ORDER FLOW TRACKING ---
         "prev_tick_price": target.get("regularMarketPrice", 0),
         "rolling_buy_vol": 0,
         "rolling_sell_vol": 0
+        
     }
 
 # ==========================================
@@ -130,15 +168,13 @@ def on_message(ws, message):
                 vol = trade['v']
                 
                 if sym in market_data:
-                    # 1. Update live tracking variables
                     market_data[sym]["current_price"] = price
                     market_data[sym]["cumulative_volume"] += vol
                     market_data[sym]["total_dollar_traded"] += (price * vol)
                     
-                    # 2. Track the High of Day (HOD)
                     if price > market_data[sym]["high_of_day_price"]:
                         market_data[sym]["high_of_day_price"] = price
-                    
+
                     # --- NEW: THE ORDER FLOW TICK TEST ---
                     prev_tick = market_data[sym]["prev_tick_price"]
                     if prev_tick > 0:
@@ -150,18 +186,17 @@ def on_message(ws, message):
                     # Save this tick's price for the next comparison
                     market_data[sym]["prev_tick_price"] = price
                     
-                    # 3. Calculate Live Percent Change
                     prev_close = market_data[sym]["prev_close"]
                     if prev_close > 0:
                         market_data[sym]["percent_change"] = ((price - prev_close) / prev_close) * 100
 
-            # --- EVALUATION PHASE (Runs every 60 seconds) ---
             current_time = time.time()
             if current_time - last_n8n_trigger >= 60:
                 last_n8n_trigger = current_time
                 triggered_symbols = []
 
-                # Format timestamps locally to UK Time
+                # --- NEW: TIMESTAMP GENERATOR ---
+                # Formats the time as HH:MM:SS (e.g., 09:45:30)
                 uk_time = datetime.now(ZoneInfo("Europe/London"))
                 timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
                 
@@ -173,6 +208,8 @@ def on_message(ws, message):
                     hod_price = metrics["high_of_day_price"]
                     current_price = metrics["current_price"]
                     price_60s_ago = metrics["price_60s_ago"]
+                    ma_5 = metrics["ma_5"]
+                    alignment = metrics["alignment_state"]
                     
                     if cum_vol > 50000 and current_price > 0: 
                         avg_price = metrics["total_dollar_traded"] / cum_vol
@@ -182,24 +219,24 @@ def on_message(ws, message):
                         if avg_price > 0:
                             upside_potential = ((hod_price - avg_price) / avg_price) * 100
 
-                        # --- NEW: SUPERNOVA CEILING ---
-                        # Require 45% of the morning's total run, with a 5% floor, capping at a 15% maximum requirement.
-                        dynamic_target =  max(5.0, p_change * 0.45)
+                        dynamic_target = min(15.0, max(5.0, p_change * 0.45))
 
-                        # --- NEW: WHOLE-DOLLAR CONVERGENCE LOGIC ---
                         nearest_whole_dollar = round(current_price)
-                        
                         is_converging = False
                         if current_price > 2.00:
                             cents_away = abs(current_price - nearest_whole_dollar)
                             if cents_away <= 0.05:
                                 is_converging = True
 
-                        # --- NEW: FALLING KNIFE FILTER ---
                         is_bouncing = current_price >= price_60s_ago
-
-                        # --- NEW: STRICT STOP-LOSS CALCULATION ---
                         stop_loss_price = avg_price * 0.975
+                        
+                        extension_pct = 0.0
+                        is_over_extended = False
+                        if ma_5 > 0:
+                            extension_pct = ((current_price - ma_5) / ma_5) * 100
+                            if extension_pct >= 50.0:
+                                is_over_extended = True
 
                         # --- NEW: 60-SECOND ORDER FLOW DELTA ---
                         buy_v = metrics["rolling_buy_vol"]
@@ -215,9 +252,8 @@ def on_message(ws, message):
                         market_data[sym]["rolling_buy_vol"] = 0
                         market_data[sym]["rolling_sell_vol"] = 0
                         
-                        print(f"[{sym}] +{p_change:.2f}% | Price: {current_price:.2f} | Vol: {cum_vol} | VWAP Dist: {vwap_distance:.2f}% | Upside to HOD: {upside_potential:.2f}% | Target Needed: {dynamic_target:.2f}% | Converging: {is_converging} | Delta: {order_flow_delta_pct:.2f}% | Bouncing: {is_bouncing}")
+                        print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | Converge: {is_converging} | Delta: {order_flow_delta_pct:.2f}% | Bounce: {is_bouncing} | VWAPDist: {vwap_distance:.2f}% | Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}%")
                         
-                        # THE DYNAMIC RUNNER LOGIC GATE
                         if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0 and is_bouncing:
                             triggered_symbols.append({
                                 "symbol": sym,
@@ -229,17 +265,19 @@ def on_message(ws, message):
                                 "live_volume": cum_vol,
                                 "whole_dollar_convergence": is_converging,
                                 "stop_loss_price": round(stop_loss_price, 2),
+                                "daily_alignment_state": alignment,
+                                "extension_from_5ma": round(extension_pct, 2),
+                                "is_over_extended": is_over_extended,
+                                "DateTime":timestamp_str,
                                 "daily_macro_uptrend": metrics["macro_uptrend"],
                                 "order_flow_delta_1m": round(order_flow_delta_pct, 2)
+                                
                             })
 
-                # --- NEW: UPDATE BOT MEMORY ---
-                # Properly indented OUTSIDE the evaluation loop, to update the memory for the next 60s cycle
                 for sym in market_data:
                     if market_data[sym]["current_price"] > 0:
                         market_data[sym]["price_60s_ago"] = market_data[sym]["current_price"]
                 
-                # Fire the n8n Webhook asynchronously to prevent WebSocket freezing
                 if triggered_symbols:
                     print(f"\n>>> FIRING N8N WEBHOOK! {len(triggered_symbols)} stocks triggered algorithmic execution! <<<")
                     payload = {
@@ -248,7 +286,6 @@ def on_message(ws, message):
                         "top_ranked_symbols": triggered_symbols
                     }
                     
-                    # Execute the POST request in a background thread
                     threading.Thread(
                         target=requests.post, 
                         args=(N8N_WEBHOOK_URL,), 
@@ -256,7 +293,7 @@ def on_message(ws, message):
                     ).start()
 
     except json.JSONDecodeError:
-        pass # Silently ignore weird non-JSON packets from Finnhub (e.g., connection pings)
+        pass
     except Exception as e:
         print(f"WebSocket processing error: {e}")
 
