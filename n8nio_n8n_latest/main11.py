@@ -69,7 +69,8 @@ def get_morning_watchlist():
                 "day_volume": day_volume,
                 "seed_dollar_traded": seed_dollar_traded,
                 "fifty_day_avg": fifty_day_avg,
-                "macro_uptrend": macro_uptrend
+                "macro_uptrend": macro_uptrend,
+                "regularMarketPrice": current_price
             })
             
         top_40 = qualified_symbols[:40]
@@ -132,7 +133,7 @@ for target in TODAYS_TARGETS:
     sym = target["symbol"].replace('-', '.')
     market_data[sym] = {
         "prev_close": target.get("prev_close", 0),
-        "current_price": 0,
+        "current_price": target.get("regularMarketPrice", 0),
         "cumulative_volume": target.get("day_volume", 0),           
         "total_dollar_traded": target.get("seed_dollar_traded", 0), 
         "percent_change": 0,
