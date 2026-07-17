@@ -1,22 +1,12 @@
-# Use the official n8n image as the base
-FROM n8nio/n8n:latest
-
-# Switch to root to install dependencies
+FROM n8nio/runners:latest
 USER root
+WORKDIR /opt/runners/task-runner-python
 
-# Install Python and pip using Alpine's package manager
-RUN apk add --no-cache python3 py3-pip
+# Add all the packages you need here, separated by spaces
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir websockets requests pandas numpy websocket-client finnhub-python polars yfinance \
+    scipy matplotlib seaborn plotly streamlit \
+    statsmodels
 
-# Create a virtual environment
-RUN python3 -m venv /opt/venv
 
-# Activate the virtual environment and install dependencies
-COPY requirements.txt /tmp/requirements.txt
-RUN . /opt/venv/bin/activate && pip install --no-cache-dir -r /tmp/requirements.txt
-
-# Make the virtual environment the default for Python
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Switch back to the default non-root user
-USER node
-USER node
+USER runner
