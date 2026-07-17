@@ -12,7 +12,7 @@ import sys
 # CONFIGURATION
 # ==========================================
 # Create a NEW webhook in n8n for this specific Swing Pipeline
-N8N_SWING_WEBHOOK_URL = "YOUR_NEW_N8N_WEBHOOK_URL_HERE"
+N8N_SWING_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/b5af74d8-d66a-4bc1-b615-ed572b5b4053"
 
 def get_swing_universe():
     print("\n--- BOOTING MACRO SWING SCREENER ---")
