@@ -19,7 +19,7 @@ def get_swing_universe():
     try:
         print("Scanning for Mid-to-Mega Cap stocks ($2B+) with structural liquidity...")
         q = EquityQuery('and', [
-            EquityQuery('eq',  ['region', 'us']),
+            EquityQuery('eq',  ['region', 'uk']),
             EquityQuery('gte', ['intradaymarketcap', 60000000]), # $2 Billion+ Market Cap
             EquityQuery('gte', ['avgdailyvol3m', 250000]),        # 1M+ Average Daily Volume
             EquityQuery('gt',  ['intradayprice', 1.00])            # Exclude penny stocks
