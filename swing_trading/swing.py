@@ -22,7 +22,7 @@ def get_swing_universe():
             EquityQuery('eq',  ['region', 'us']),
             EquityQuery('gte', ['intradaymarketcap', 2000000000]), # $2 Billion+ Market Cap
             EquityQuery('gte', ['avgdailyvol3m', 1000000]),        # 1M+ Average Daily Volume
-            EquityQuery('gt',  ['intradayprice', 10.00])            # Exclude penny stocks
+            EquityQuery('gt',  ['intradayprice', 1.00])            # Exclude penny stocks
         ])
 
         # Pull the top 100 strongest performing large caps this month
