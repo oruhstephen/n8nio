@@ -27,7 +27,7 @@ def get_morning_watchlist():
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
             EquityQuery('gte', ['intradaymarketcap', 60000000]),  # $60M+ Market Cap
-            EquityQuery('gt',  ['intradayprice', 1.00]),              # Price > $1
+            EquityQuery('gt',  ['intradayprice', 1.00]),           # Price > $1
             EquityQuery('gte', ['percentchange', 3.0]),            # +3% Intraday Gain
             EquityQuery('gte', ['avgdailyvol3m', 250000])          # 250k+ 3-Month Average Vol
         ])
@@ -49,7 +49,7 @@ def get_morning_watchlist():
             day_volume = quote.get("regularMarketVolume", 0)
             fifty_day_avg = quote.get("fiftyDayAverage", 0) # Used for Alignment
 
-            # If today's price is higher than the 50-day average, the macro trend is Bullish.
+            # Macro Trend Check
             macro_uptrend = False
             if current_price > fifty_day_avg and fifty_day_avg > 0:
                 macro_uptrend = True
@@ -65,6 +65,7 @@ def get_morning_watchlist():
             qualified_symbols.append({
                 "symbol": sym,
                 "prev_close": prev_close,
+                "live_change": live_change,
                 "day_high": day_high,
                 "day_volume": day_volume,
                 "seed_dollar_traded": seed_dollar_traded,
@@ -78,7 +79,7 @@ def get_morning_watchlist():
         # ==========================================
         # BATCH DOWNLOAD: ALIGNMENT & GRAVITY CALC
         # ==========================================
-        print(f"\nDownloading 2-month history for {len(top_40)} symbols to calculate Alignments, Over-Extension and high-momentum matches...")
+        print(f"\nDownloading 2-month history for {len(top_40)} symbols to calculate Alignments & Moving Averages...")
         sym_list = [t["symbol"] for t in top_40]
         
         if sym_list:
@@ -91,10 +92,13 @@ def get_morning_watchlist():
                 target["alignment_state"] = "MIXED"
                 
                 try:
-                    stock_closes = closes.dropna() if len(sym_list) == 1 else closes[sym].dropna()
+                    # Robust DataFrame handling for multi-symbol download
+                    if isinstance(closes, pd.DataFrame) and sym in closes.columns:
+                        stock_closes = closes[sym].dropna()
+                    else:
+                        stock_closes = closes.dropna()
                     
                     if len(stock_closes) >= 21:
-                        # Calculate all required moving averages
                         ma_5 = stock_closes.tail(5).mean()
                         ma_10 = stock_closes.tail(10).mean()
                         ma_21 = stock_closes.tail(21).mean()
@@ -136,18 +140,17 @@ for target in TODAYS_TARGETS:
         "current_price": target.get("regularMarketPrice", 0),
         "cumulative_volume": target.get("day_volume", 0),           
         "total_dollar_traded": target.get("seed_dollar_traded", 0), 
-        "percent_change": 0,
+        "percent_change": target.get("live_change", 0),  # Seeded with initial percent change
         "high_of_day_price": target.get("day_high", 0),             
         "price_60s_ago": target.get("regularMarketPrice", 0),
         "ma_5": target.get("ma_5", 0.0), 
         "alignment_state": target.get("alignment_state", "MIXED"),
         "macro_uptrend": target.get("macro_uptrend", False),
 
-        # --- NEW: ORDER FLOW TRACKING ---
+        # ORDER FLOW TRACKING
         "prev_tick_price": target.get("regularMarketPrice", 0),
         "rolling_buy_vol": 0,
         "rolling_sell_vol": 0
-        
     }
 
 # ==========================================
@@ -176,15 +179,14 @@ def on_message(ws, message):
                     if price > market_data[sym]["high_of_day_price"]:
                         market_data[sym]["high_of_day_price"] = price
 
-                    # --- NEW: THE ORDER FLOW TICK TEST ---
+                    # ORDER FLOW TICK TEST
                     prev_tick = market_data[sym]["prev_tick_price"]
                     if prev_tick > 0:
                         if price > prev_tick:
-                            market_data[sym]["rolling_buy_vol"] += vol  # Aggressive Ask Slap
+                            market_data[sym]["rolling_buy_vol"] += vol  # Ask Slap
                         elif price < prev_tick:
-                            market_data[sym]["rolling_sell_vol"] += vol # Aggressive Bid Hit
+                            market_data[sym]["rolling_sell_vol"] += vol # Bid Hit
                     
-                    # Save this tick's price for the next comparison
                     market_data[sym]["prev_tick_price"] = price
                     
                     prev_close = market_data[sym]["prev_close"]
@@ -196,8 +198,6 @@ def on_message(ws, message):
                 last_n8n_trigger = current_time
                 triggered_symbols = []
 
-                # --- NEW: TIMESTAMP GENERATOR ---
-                # Formats the time as HH:MM:SS (e.g., 09:45:30)
                 uk_time = datetime.now(ZoneInfo("Europe/London"))
                 timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
                 
@@ -211,6 +211,19 @@ def on_message(ws, message):
                     price_60s_ago = metrics["price_60s_ago"]
                     ma_5 = metrics["ma_5"]
                     alignment = metrics["alignment_state"]
+                    
+                    # Calculate 60-second Order Flow Delta
+                    buy_v = metrics["rolling_buy_vol"]
+                    sell_v = metrics["rolling_sell_vol"]
+                    total_tick_vol = buy_v + sell_v
+                    
+                    order_flow_delta_pct = 0.0
+                    if total_tick_vol > 0:
+                        order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100
+                        
+                    # RESET ROLLING VOLUMES UNCONDITIONALLY EVERY 60 SECONDS
+                    market_data[sym]["rolling_buy_vol"] = 0
+                    market_data[sym]["rolling_sell_vol"] = 0
                     
                     if cum_vol > 50000 and current_price > 0: 
                         avg_price = metrics["total_dollar_traded"] / cum_vol
@@ -239,20 +252,6 @@ def on_message(ws, message):
                             if extension_pct >= 50.0:
                                 is_over_extended = True
 
-                        # --- NEW: 60-SECOND ORDER FLOW DELTA ---
-                        buy_v = metrics["rolling_buy_vol"]
-                        sell_v = metrics["rolling_sell_vol"]
-                        total_tick_vol = buy_v + sell_v
-                        
-                        order_flow_delta_pct = 0.0
-                        if total_tick_vol > 0:
-                            # Formula: (Buys - Sells) / Total * 100
-                            order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100
-                            
-                        # Reset the rolling volumes for the next 60-second window
-                        market_data[sym]["rolling_buy_vol"] = 0
-                        market_data[sym]["rolling_sell_vol"] = 0
-                        
                         print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | Converge: {is_converging} | Delta: {order_flow_delta_pct:.2f}% | Bounce: {is_bouncing} | VWAPDist: {vwap_distance:.2f}% | Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}%")
                         
                         if p_change >= 8.0 and upside_potential >= dynamic_target and -0.5 <= vwap_distance <= 1.0 and is_bouncing:
@@ -269,10 +268,9 @@ def on_message(ws, message):
                                 "daily_alignment_state": alignment,
                                 "extension_from_5ma": round(extension_pct, 2),
                                 "is_over_extended": is_over_extended,
-                                "DateTime":timestamp_str,
+                                "DateTime": timestamp_str,
                                 "daily_macro_uptrend": metrics["macro_uptrend"],
                                 "order_flow_delta_1m": round(order_flow_delta_pct, 2)
-                                
                             })
 
                 for sym in market_data:
