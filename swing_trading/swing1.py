@@ -5,32 +5,40 @@ from yfinance import EquityQuery
 import requests
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import sys
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 N8N_SWING_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/b5af74d8-d66a-4bc1-b615-ed572b5b4053"
 
-MIN_MARKET_CAP = 2_000_000_000      # $2B+
-MIN_AVG_VOLUME = 1_000_000          # 1M+ shares/day
-MIN_PRICE = 10.00                   # matches your write-up (was $1 in original code)
-UNIVERSE_SIZE = 150                 # how many top-cap names to pull each week
+# --- PERSISTENT VOLUME STORAGE SETUP ---
+# Maps directly to Easypanel Mount Path: /app/data
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
-MAX_EXTENSION_PCT = 15.0            # gate 2: don't chase >15% above 50-SMA
-PULLBACK_LOW, PULLBACK_HIGH = -1.5, 3.0   # gate 3: distance band around 21-EMA
-MIN_UPSIDE_TO_HIGH_PCT = 5.0        # minimum reward to bother with the trade
+# --- SCREENER PARAMETERS ---
+MIN_MARKET_CAP = 2_000_000_000      # $2B+ Market Cap
+MIN_AVG_VOLUME = 1_000_000          # 1M+ shares/day average volume
+MIN_PRICE = 10.00                   # $10.00 Minimum price
+UNIVERSE_SIZE = 150                 # Top 150 largest caps scanned weekly
 
-ATR_PERIOD = 14
-ATR_STOP_MULTIPLIER = 1.5           # stop = 21-EMA minus 1.5x ATR
-MIN_REWARD_RISK_RATIO = 1.5         # reward must be at least 1.5x the risk
+# --- QUANTITATIVE LOGIC GATES ---
+MAX_EXTENSION_PCT = 15.0            # Gate 2: Don't chase >15% above 50-SMA
+PULLBACK_LOW, PULLBACK_HIGH = -1.5, 3.0   # Gate 3: Distance band around 21-EMA (%)
+MIN_UPSIDE_TO_HIGH_PCT = 5.0        # Gate 4: Minimum upside potential to 20d high
 
-EARNINGS_BLACKOUT_DAYS = 7          # skip names reporting earnings within N days
+# --- RISK & VOLATILITY FILTERS ---
+ATR_PERIOD = 14                     # 14-day Average True Range
+ATR_STOP_MULTIPLIER = 1.5           # Stop = 21-EMA minus (1.5 * ATR)
+MIN_REWARD_RISK_RATIO = 1.5         # Reward must be >= 1.5x Risk
 
-SEEN_SYMBOLS_FILE = "seen_symbols.json"
-DEDUP_WINDOW_DAYS = 21              # don't re-alert the same symbol within N days
+# --- FILTERS & STATE ---
+EARNINGS_BLACKOUT_DAYS = 7          # Skip stocks with earnings in <= 7 days
+DEDUP_WINDOW_DAYS = 21              # Don't re-alert same stock within 21 days
 
 
 # ==========================================
@@ -38,16 +46,12 @@ DEDUP_WINDOW_DAYS = 21              # don't re-alert the same symbol within N da
 # ==========================================
 def get_swing_universe():
     """
-    Pull the broadest reasonable set of large, liquid stocks — sorted by
-    market cap, NOT by today's percent change. Sorting by percentchange
-    (the original version) biases the universe toward stocks already
-    moving hard *today*, which is the opposite of what a quiet pullback
-    setup looks like — those names get excluded before the gates even run.
+    Pulls top US stocks sorted by Market Cap to eliminate daily percentage-change bias.
     """
     print("\n--- BOOTING MACRO SWING SCREENER ---")
     try:
-        print(f"Scanning for stocks with mkt cap >= ${MIN_MARKET_CAP:,}, "
-              f"avg vol >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE}...")
+        print(f"Scanning for US stocks with Market Cap >= ${MIN_MARKET_CAP:,}, "
+              f"Avg Vol >= {MIN_AVG_VOLUME:,}, Price >= ${MIN_PRICE}...")
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
             EquityQuery('gte', ['intradaymarketcap', MIN_MARKET_CAP]),
@@ -55,11 +59,11 @@ def get_swing_universe():
             EquityQuery('gt',  ['intradayprice', MIN_PRICE])
         ])
 
-        # Sort by market cap (stable, structural) instead of percentchange (noisy, momentum-biased)
+        # Sort by market cap (stable, structural) instead of percentchange
         response = yf.screen(q, sortField='intradaymarketcap', sortAsc=False)
         quotes = response.get('quotes', [])
 
-        symbols = [item.get("symbol") for item in quotes][:UNIVERSE_SIZE]
+        symbols = [item.get("symbol") for item in quotes if item.get("symbol")][:UNIVERSE_SIZE]
         print(f"Found {len(symbols)} structural targets. Downloading 1-year historical data...")
         return symbols
 
@@ -69,7 +73,7 @@ def get_swing_universe():
 
 
 # ==========================================
-# DE-DUP STATE (avoid re-firing the same symbol every week)
+# STATE MANAGEMENT (DEDUPLICATION)
 # ==========================================
 def load_seen_symbols():
     if os.path.exists(SEEN_SYMBOLS_FILE):
@@ -81,14 +85,20 @@ def load_seen_symbols():
     return {}
 
 def save_seen_symbols(seen):
-    with open(SEEN_SYMBOLS_FILE, "w") as f:
-        json.dump(seen, f, indent=2)
+    try:
+        with open(SEEN_SYMBOLS_FILE, "w") as f:
+            json.dump(seen, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save state to persistent volume: {e}")
 
 def recently_alerted(symbol, seen):
     if symbol not in seen:
         return False
-    last_alert = datetime.fromisoformat(seen[symbol])
-    return (datetime.now() - last_alert) < timedelta(days=DEDUP_WINDOW_DAYS)
+    try:
+        last_alert = datetime.fromisoformat(seen[symbol])
+        return (datetime.now() - last_alert) < timedelta(days=DEDUP_WINDOW_DAYS)
+    except Exception:
+        return False
 
 
 # ==========================================
@@ -96,10 +106,7 @@ def recently_alerted(symbol, seen):
 # ==========================================
 def has_upcoming_earnings(symbol, blackout_days=EARNINGS_BLACKOUT_DAYS):
     """
-    Returns True if the symbol has an earnings date within the blackout
-    window, so we can skip it (avoid a stop-defeating earnings gap).
-    Fails "open" (returns False) if the earnings calendar isn't available,
-    since we'd rather occasionally miss a blackout than kill the whole run.
+    Returns True if an earnings report occurs within the blackout window.
     """
     try:
         cal = yf.Ticker(symbol).get_earnings_dates(limit=4)
@@ -113,11 +120,11 @@ def has_upcoming_earnings(symbol, blackout_days=EARNINGS_BLACKOUT_DAYS):
         days_out = (next_earnings - today).days
         return 0 <= days_out <= blackout_days
     except Exception:
-        return False
+        return False # Fails open to avoid stopping execution on API timeout
 
 
 # ==========================================
-# MAIN ANALYSIS
+# MAIN ANALYSIS ENGINE
 # ==========================================
 def run_macro_analysis():
     symbols = get_swing_universe()
@@ -126,11 +133,11 @@ def run_macro_analysis():
 
     seen = load_seen_symbols()
 
-    print("Downloading institutional order flow data...")
+    print("Downloading institutional daily market data...")
     data = yf.download(symbols, period="1y", group_by='ticker', progress=False)
 
     triggered_symbols = []
-    skipped = {}  # symbol -> reason, for end-of-run visibility instead of silent `pass`
+    skipped = {}
 
     print("\n--- INITIATING ALGORITHMIC SWING FILTERS ---")
     for sym in symbols:
@@ -142,12 +149,12 @@ def run_macro_analysis():
                 skipped[sym] = "insufficient history (<200 days)"
                 continue
 
-            # --- INDICATORS ---
+            # --- 1. INDICATORS ---
             df['21_EMA'] = df['Close'].ewm(span=21, adjust=False).mean()
             df['50_SMA'] = df['Close'].rolling(window=50).mean()
             df['200_SMA'] = df['Close'].rolling(window=200).mean()
 
-            # ATR(14) for a volatility-aware stop instead of a flat 3%
+            # ATR(14) Calculation for Volatility Sizing
             high_low = df['High'] - df['Low']
             high_close = (df['High'] - df['Close'].shift()).abs()
             low_close = (df['Low'] - df['Close'].shift()).abs()
@@ -185,35 +192,38 @@ def run_macro_analysis():
             vol_20d_avg = df['Volume'].tail(20).mean()
             is_low_vol_pullback = vol_3d_avg < vol_20d_avg
 
-            print(f"[{sym}] Price: ${current_price:.2f} | Dist to 21-EMA: {dist_21:.2f}% | "
-                  f"Dist to 50-SMA: {ext_50:.2f}% | Low Vol Pullback: {is_low_vol_pullback}")
-
-            if not (is_low_vol_pullback and upside_to_swing_high > MIN_UPSIDE_TO_HIGH_PCT):
-                skipped[sym] = "failed volume/upside gate"
+            if not is_low_vol_pullback:
+                skipped[sym] = "failed low-volume pullback check"
                 continue
 
-            # --- ATR-BASED STOP (replaces flat 3% below 21-EMA) ---
+            if upside_to_swing_high < MIN_UPSIDE_TO_HIGH_PCT:
+                skipped[sym] = f"insufficient upside potential ({upside_to_swing_high:.1f}%)"
+                continue
+
+            # --- GATE 5: ATR STOP & RISK/REWARD ---
             stop_loss = ema_21 - (ATR_STOP_MULTIPLIER * atr)
             risk_pct = ((current_price - stop_loss) / current_price) * 100
 
-            # --- RISK/REWARD FILTER ---
             if risk_pct <= 0:
                 skipped[sym] = "invalid risk (stop above current price)"
                 continue
+
             reward_risk_ratio = upside_to_swing_high / risk_pct
             if reward_risk_ratio < MIN_REWARD_RISK_RATIO:
-                skipped[sym] = f"poor reward:risk ({reward_risk_ratio:.2f})"
+                skipped[sym] = f"poor reward:risk ratio ({reward_risk_ratio:.2f})"
                 continue
 
-            # --- DE-DUP CHECK ---
+            # --- GATE 6: DE-DUPLICATION CHECK ---
             if recently_alerted(sym, seen):
-                skipped[sym] = "already alerted within dedup window"
+                skipped[sym] = "already alerted within 21-day window"
                 continue
 
-            # --- EARNINGS BLACKOUT ---
+            # --- GATE 7: EARNINGS BLACKOUT CHECK ---
             if has_upcoming_earnings(sym):
-                skipped[sym] = "earnings within blackout window"
+                skipped[sym] = "earnings report within 7 days"
                 continue
+
+            print(f" -> [MATCH] {sym} | Price: ${current_price:.2f} | Dist 21-EMA: {dist_21:.2f}% | Ext 50-SMA: {ext_50:.2f}% | R:R Ratio: {reward_risk_ratio:.2f}")
 
             triggered_symbols.append({
                 "symbol": sym,
@@ -232,21 +242,22 @@ def run_macro_analysis():
             })
 
         except Exception as e:
-            skipped[sym] = f"error: {e}"
+            skipped[sym] = f"error processing: {e}"
             continue
 
-    # --- SUMMARY OF SKIPPED SYMBOLS (visibility instead of silent `pass`) ---
-    print(f"\n--- {len(skipped)} symbols skipped, {len(triggered_symbols)} passed all gates ---")
+    # --- TERMINAL SUMMARY LOGGING ---
+    print(f"\n--- SCAN COMPLETE: {len(skipped)} skipped, {len(triggered_symbols)} passed all gates ---")
 
     # --- FIRE PAYLOAD TO N8N ---
     if triggered_symbols:
+        # Sort by best Risk-to-Reward ratio
         triggered_symbols = sorted(triggered_symbols, key=lambda x: x['reward_risk_ratio'], reverse=True)
         top_5_setups = triggered_symbols[:5]
 
         uk_time = datetime.now(ZoneInfo("Europe/London"))
         timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Update de-dup state so these don't refire next week
+        # Record timestamp to persistent memory
         for setup in top_5_setups:
             seen[setup["symbol"]] = datetime.now().isoformat()
         save_seen_symbols(seen)
@@ -261,7 +272,6 @@ def run_macro_analysis():
         requests.post(N8N_SWING_WEBHOOK_URL, json=payload)
     else:
         print("\nNo setups met the strict institutional swing criteria today. Cash is a position.")
-
 
 if __name__ == "__main__":
     run_macro_analysis()
