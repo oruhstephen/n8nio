@@ -228,8 +228,8 @@ def evaluation_loop():
                     in_cooldown = (current_time - last_alert) < ALERT_COOLDOWN_SECONDS
 
                     print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | "
-                          f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
-                          f"Up2HOD: {upside_potential:.2f}% | Cooldown: {in_cooldown}")
+                          f"Converge: {is_converging} | Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
+                          f"Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}%") | Cooldown: {in_cooldown}")
                     
                     # Execution Criteria Gate
                     if (p_change >= 8.0 and 
