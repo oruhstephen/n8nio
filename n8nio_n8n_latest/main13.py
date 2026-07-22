@@ -233,7 +233,7 @@ def evaluation_loop():
 
                     print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | "
                           f"Converge: {is_converging} | Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
-                          f"Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}%") | Cooldown: {in_cooldown}")
+                          f"Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}% | Cooldown: {in_cooldown}")
                     
                     # Execution Criteria Gate
                     if (p_change >= 8.0 and 
