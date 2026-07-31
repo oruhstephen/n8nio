@@ -315,6 +315,7 @@ def evaluation_loop():
                           f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
                           f"MovingUp: {is_bouncing} | DippedFlag: {metrics['dipped_below_vwap']} | "
                           f"SessionLowVWAP: {session_low_vwap_dist:.2f}% | "
+                          f"Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}% | "
                           f"Dist2HOD: {distance_to_hod_pct:.2f}% | Streak: {metrics['reclaim_streak']}")
 
                     # ==============================================================
