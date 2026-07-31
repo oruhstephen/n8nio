@@ -26,7 +26,7 @@ REFRESH_INTERVAL_SECONDS = 1800
 MAX_TICK_MOVE_PCT = 20.0
 
 # Screener parameters
-MARKET_CAP_CEILING = 2_000_000_000  # $2B Ceiling
+MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
 MIN_RELATIVE_VOLUME = 1.5
 MAX_FLOAT_SHARES = 50_000_000
 ENABLE_FLOAT_FILTER = True
@@ -81,7 +81,7 @@ def get_morning_watchlist():
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
             EquityQuery('gte', ['intradaymarketcap', 60000000]),      
-            #EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]), 
+            EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]), 
             EquityQuery('gt',  ['intradayprice', 1.00]),           
             EquityQuery('gte', ['percentchange', 3.0]),            
             EquityQuery('gte', ['avgdailyvol3m', 250000])          
