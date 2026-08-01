@@ -90,6 +90,20 @@ def get_morning_watchlist():
         response = yf.screen(q, sortField='percentchange', sortAsc=False)
         quotes = response.get('quotes', [])
         qualified_symbols = []
+        rel_vol_unavailable_count = 0
+
+        if DEBUG_PRINT_QUOTE_FIELDS and quotes:
+            sample = quotes[0]
+            print(f"\n  [DEBUG] Raw quote keys for {sample.get('symbol', '?')} "
+                  f"({len(sample)} fields):")
+            for key in sorted(sample.keys()):
+                print(f"    {key}: {sample[key]!r}")
+            has_avg_vol_3m = "averageDailyVolume3Month" in sample
+            print(f"  [DEBUG] 'averageDailyVolume3Month' present: {has_avg_vol_3m}")
+            if not has_avg_vol_3m:
+                close_matches = [k for k in sample.keys() if "volume" in k.lower() or "vol" in k.lower()]
+                print(f"  [DEBUG] Volume-related keys found instead: {close_matches}")
+            print()
 
         for quote in quotes:
             sym = quote.get("symbol")
@@ -105,8 +119,13 @@ def get_morning_watchlist():
             avg_vol_3m = quote.get("averageDailyVolume3Month", 0) or quote.get("avgdailyvol3m", 0)
 
             relative_volume = calculate_relative_volume(day_volume, avg_vol_3m)
-            if relative_volume is None or relative_volume < MIN_RELATIVE_VOLUME:
-                continue  
+            if relative_volume is None:
+                # Field wasn't available for this quote - don't punish the
+                # candidate for a data gap we can't confirm; let it through
+                # and just flag that the filter didn't actually get applied.
+                rel_vol_unavailable_count += 1
+            elif relative_volume < MIN_RELATIVE_VOLUME:
+                continue  # trading at/below its typical pace for this time of day - skip
 
             macro_uptrend = (current_price > fifty_day_avg and fifty_day_avg > 0)
             typical_price = current_price
@@ -129,12 +148,25 @@ def get_morning_watchlist():
                 "relative_volume": relative_volume
             })
 
+        if rel_vol_unavailable_count:
+            print(f"  [WARN] Relative volume unavailable for {rel_vol_unavailable_count} "
+                  f"quote(s) - those candidates were NOT filtered on RVOL. Check "
+                  f"'averageDailyVolume3Month' against a raw quote dict if this "
+                  f"count is high (set DEBUG_PRINT_QUOTE_FIELDS = True).")
+
         if ENABLE_FLOAT_FILTER and qualified_symbols:
             candidate_pool = qualified_symbols[:60]
             float_filtered = []
+            debug_shown = False
             for cand in candidate_pool:
                 try:
                     info = yf.Ticker(cand["symbol"]).info
+                    if DEBUG_PRINT_QUOTE_FIELDS and not debug_shown:
+                        has_float = "floatShares" in info
+                        print(f"  [DEBUG] 'floatShares' present in .info for "
+                              f"{cand['symbol']}: {has_float} "
+                              f"(value: {info.get('floatShares')!r})")
+                        debug_shown = True
                     float_shares = info.get("floatShares")
                     if float_shares is None or float_shares <= MAX_FLOAT_SHARES:
                         float_filtered.append(cand)
@@ -467,7 +499,7 @@ def watchlist_refresher_loop():
                 for sym in new_symbols:
                     ws_global.send(json.dumps({"type": "subscribe", "symbol": sym}))
         except Exception as e:
-            pass
+            print(f"Mid-day refresh error: {e}")
 
 # ==========================================
 # PHASE 3: WEBSOCKET EVENT LISTENERS
@@ -487,7 +519,10 @@ def on_message(ws, message):
                         prev_tick = market_data[sym]["prev_tick_price"]
                         if prev_tick > 0:
                             tick_move_pct = abs(price - prev_tick) / prev_tick * 100
-                            if tick_move_pct > MAX_TICK_MOVE_PCT: continue
+                            if tick_move_pct > MAX_TICK_MOVE_PCT:
+                                print(f"  [ANOMALY] {sym} rejected tick ${price:.2f} "
+                                      f"({tick_move_pct:.1f}% vs prev ${prev_tick:.2f}) - skipped")
+                                continue
 
                         market_data[sym]["current_price"] = price
                         market_data[sym]["cumulative_volume"] += vol
@@ -501,8 +536,10 @@ def on_message(ws, message):
                         market_data[sym]["prev_tick_price"] = price
                         prev_close = market_data[sym]["prev_close"]
                         if prev_close > 0: market_data[sym]["percent_change"] = ((price - prev_close) / prev_close) * 100
-    except Exception:
+    except json.JSONDecodeError:
         pass
+    except Exception as e:
+        print(f"WebSocket processing error: {e}")
 
 def on_error(ws, error): print(f"WebSocket Error: {error}")
 def on_close(ws, close_status_code, close_msg): print("### WebSocket Connection Closed ###")
