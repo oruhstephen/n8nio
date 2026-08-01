@@ -34,7 +34,7 @@ DEBUG_PRINT_QUOTE_FIELDS = False
 
 # --- DEEP PULLBACK / HOD-RECLAIM SIGNAL ---
 DEEP_PULLBACK_TIERS = [
-    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 4.0,  "min_order_flow_delta_pct": 15.0},
+    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 3.1,  "min_order_flow_delta_pct": 15.0},
     {"name": "TIER_2_MODERATE", "min_depth_pct": 7.0,  "min_order_flow_delta_pct": 25.0},
     {"name": "TIER_3_DEEP",     "min_depth_pct": 10.0, "min_order_flow_delta_pct": 35.0},
 ]
