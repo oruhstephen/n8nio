@@ -310,6 +310,13 @@ def evaluation_loop():
                     pullback_in_cooldown = (current_time - metrics["last_pullback_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     reclaim_in_cooldown = (current_time - metrics["last_reclaim_alert_time"]) < ALERT_COOLDOWN_SECONDS
 
+                    # Calculate how far we have bounced off the absolute bottom
+                    distance_from_low_pct = 0.0
+                    if metrics["session_low_price"] > 0:
+                        distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100
+
+                    
+
                     print(f"[{sym}] +{p_change:.2f}% | Align: {alignment} | Ext5MA: +{extension_pct:.1f}% | "
                           f"Converge: {is_converging} | Danger: {is_over_extended} | "
                           f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
@@ -394,10 +401,11 @@ def evaluation_loop():
                         })
 
                     # ==============================================================
-                    # EXECUTION GATE 3: DEEP PULLBACK REVERSAL
+                    # EXECUTION GATE 3: DEEP PULLBACK REVERSAL (THE V-BOTTOM CATCH)
                     # ==============================================================
                     elif (pullback_tier is not None and
-                          is_reclaiming_hod and
+                          vwap_distance < 0 and  # Must still be below VWAP (catching the move early)
+                          distance_from_low_pct >= 1.0 and  # Must have bounced at least 1% off the exact bottom to confirm the pivot
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
                           order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
                           not pullback_in_cooldown):
