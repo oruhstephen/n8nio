@@ -181,6 +181,8 @@ def get_morning_watchlist():
         if sym_list:
             hist_data = yf.download(sym_list, period="2mo", progress=False)
             closes = hist_data['Close'] if 'Close' in hist_data else hist_data
+            highs = hist_data['High'] if 'High' in hist_data else None
+            lows = hist_data['Low'] if 'Low' in hist_data else None
                 
             for target in top_40:
                 sym = target["symbol"]
@@ -200,12 +202,29 @@ def get_morning_watchlist():
                         ma_50 = target.get("fifty_day_avg", 0)
                         
                         target["ma_5"] = ma_5
+
+                        # --- NEW: Calculate Average Daily Range (ADR %) over last 21 days ---
+                        target["adr_pct"] = 0.0
+                        if highs is not None and lows is not None:
+                            # Handle single-stock vs multi-stock dataframe structures
+                            if isinstance(highs, pd.DataFrame) and sym in highs.columns:
+                                s_highs = highs[sym].tail(21)
+                                s_lows = lows[sym].tail(21)
+                            else:
+                                s_highs = highs.tail(21)
+                                s_lows = lows.tail(21)
+                                
+                            daily_ranges = ((s_highs - s_lows) / s_lows) * 100
+                            target["adr_pct"] = daily_ranges.mean()
+                        
                         if ma_50 > 0:
                             if ma_10 > ma_21 and ma_21 > ma_50: target["alignment_state"] = "FULL_BULLISH"
                             elif ma_10 < ma_21 and ma_21 < ma_50: target["alignment_state"] = "BEARISH"
                             else:
                                 min_ma, max_ma = min(ma_10, ma_21, ma_50), max(ma_10, ma_21, ma_50)
                                 if ((max_ma - min_ma) / min_ma) <= 0.02: target["alignment_state"] = "COMPRESSION"
+
+                        
                 except Exception:
                     pass
 
@@ -225,6 +244,7 @@ def register_symbol_in_memory(target):
 
             market_data[sym] = {
                 "prev_close": target.get("prev_close", 0),
+                "adr_pct": target.get("adr_pct", 0.0), # Save ADR to memory
                 "current_price": seed_price,
                 "cumulative_volume": target.get("day_volume", 0),           
                 "total_dollar_traded": target.get("seed_dollar_traded", 0), 
@@ -353,7 +373,7 @@ def evaluation_loop():
                           f"Converge: {is_converging} | Danger: {is_over_extended} | "
                           f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
                           f"MovingUp: {is_bouncing} | DippedFlag: {metrics['dipped_below_vwap']} | "
-                          f"SessionLowVWAP: {session_low_vwap_dist:.2f}% | "
+                          f"SessionLowVWAP: {session_low_vwap_dist:.2f}% |  ADR: {metrics['adr_pct']:.2f}% | "
                           f"Up2HOD: {upside_potential:.2f}% | T.Need: {dynamic_target:.2f}% | "
                           f"Dist2HOD: {distance_to_hod_pct:.2f}% | Streak: {metrics['reclaim_streak']}")
 
@@ -393,7 +413,8 @@ def evaluation_loop():
                             "is_over_extended": is_over_extended,
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
-                            "order_flow_delta_1m": round(order_flow_delta_pct, 2)
+                            "order_flow_delta_1m": round(order_flow_delta_pct, 2),
+                            "historical_adr_pct": round(metrics["adr_pct"], 2)
                         })
 
                     # ==============================================================
@@ -429,7 +450,8 @@ def evaluation_loop():
                             "is_over_extended": is_over_extended,
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
-                            "order_flow_delta_1m": round(order_flow_delta_pct, 2)
+                            "order_flow_delta_1m": round(order_flow_delta_pct, 2),
+                            "historical_adr_pct": round(metrics["adr_pct"], 2)
                         })
 
                     # ==============================================================
@@ -467,7 +489,8 @@ def evaluation_loop():
                             "is_over_extended": is_over_extended,
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
-                            "order_flow_delta_1m": round(order_flow_delta_pct, 2)
+                            "order_flow_delta_1m": round(order_flow_delta_pct, 2),
+                            "historical_adr_pct": round(metrics["adr_pct"], 2)
                         })
 
                 metrics["price_60s_ago"] = current_price
