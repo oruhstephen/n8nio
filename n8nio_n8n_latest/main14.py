@@ -118,6 +118,15 @@ def get_morning_watchlist():
             fifty_day_avg = quote.get("fiftyDayAverage", 0)
             avg_vol_3m = quote.get("averageDailyVolume3Month", 0) or quote.get("avgdailyvol3m", 0)
 
+            # --- NEW: Market Cap Tier Classification ---
+            raw_market_cap = quote.get("marketCap", 0)
+            if raw_market_cap < 300_000_000:
+                cap_tier = "MICRO/SMALL"
+            elif raw_market_cap < 2_000_000_000:
+                cap_tier = "MID_CAP"
+            else:
+                cap_tier = "LARGE_CAP"
+
             relative_volume = calculate_relative_volume(day_volume, avg_vol_3m)
             if relative_volume is None:
                 # Field wasn't available for this quote - don't punish the
@@ -141,6 +150,7 @@ def get_morning_watchlist():
                 "day_high": day_high,
                 "day_low": day_low,
                 "day_volume": day_volume,
+                "market_cap_tier": cap_tier, 
                 "seed_dollar_traded": seed_dollar_traded,
                 "fifty_day_avg": fifty_day_avg,
                 "macro_uptrend": macro_uptrend,
@@ -246,6 +256,7 @@ def register_symbol_in_memory(target):
                 "prev_close": target.get("prev_close", 0),
                 "adr_pct": target.get("adr_pct", 0.0), # Save ADR to memory
                 "current_price": seed_price,
+                "market_cap_tier": target.get("market_cap_tier", "UNKNOWN"),
                 "cumulative_volume": target.get("day_volume", 0),           
                 "total_dollar_traded": target.get("seed_dollar_traded", 0), 
                 "percent_change": target.get("live_change", 0),
@@ -414,7 +425,8 @@ def evaluation_loop():
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
-                            "historical_adr_pct": round(metrics["adr_pct"], 2)
+                            "historical_adr_pct": round(metrics["adr_pct"], 2),
+                            "market_cap_tier": metrics["market_cap_tier"],
                         })
 
                     # ==============================================================
@@ -451,7 +463,8 @@ def evaluation_loop():
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
-                            "historical_adr_pct": round(metrics["adr_pct"], 2)
+                            "historical_adr_pct": round(metrics["adr_pct"], 2),
+                            "market_cap_tier": metrics["market_cap_tier"],
                         })
 
                     # ==============================================================
@@ -490,7 +503,8 @@ def evaluation_loop():
                             "DateTime": timestamp_str,
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
-                            "historical_adr_pct": round(metrics["adr_pct"], 2)
+                            "historical_adr_pct": round(metrics["adr_pct"], 2),
+                            "market_cap_tier": metrics["market_cap_tier"],
                         })
 
                 metrics["price_60s_ago"] = current_price
