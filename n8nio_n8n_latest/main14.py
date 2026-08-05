@@ -426,7 +426,7 @@ def evaluation_loop():
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
                             "historical_adr_pct": round(metrics["adr_pct"], 2),
-                            "market_cap_tier": metrics["market_cap_tier"],
+                            "market_cap_tier": metrics["market_cap_tier"]
                         })
 
                     # ==============================================================
@@ -464,7 +464,7 @@ def evaluation_loop():
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
                             "historical_adr_pct": round(metrics["adr_pct"], 2),
-                            "market_cap_tier": metrics["market_cap_tier"],
+                            "market_cap_tier": metrics["market_cap_tier"]
                         })
 
                     # ==============================================================
@@ -504,7 +504,7 @@ def evaluation_loop():
                             "daily_macro_uptrend": metrics["macro_uptrend"],
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
                             "historical_adr_pct": round(metrics["adr_pct"], 2),
-                            "market_cap_tier": metrics["market_cap_tier"],
+                            "market_cap_tier": metrics["market_cap_tier"]
                         })
 
                 metrics["price_60s_ago"] = current_price
