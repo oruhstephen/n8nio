@@ -290,7 +290,9 @@ def run_macro_analysis():
                                 "target_price": round(pullback_target_price, 2),
                                 "estimated_gain_pct": round(upside_to_swing_high_pct, 2),
                                 "recommended_stop_loss": round(stop_loss_pb, 2),
-                                "reward_risk_ratio": round((upside_to_swing_high_pct / risk_pct_pb), 2)
+                                "reward_risk_ratio": round((upside_to_swing_high_pct / risk_pct_pb), 2),
+                                "ema_21": round(ema_21, 2),   
+                                "sma_50": round(sma_50, 2)
                             })
 
             # --- STRATEGY 2: CONSISTENT MOMENTUM LOGIC ---
@@ -324,7 +326,10 @@ def run_macro_analysis():
                                 "estimated_gain_pct": round(momentum_estimated_gain_pct, 2),
                                 "recommended_stop_loss": round(stop_loss_mom, 2),
                                 "green_days_last_5": green_days_5d,
-                                "adx_strength": round(adx_val, 2)
+                                "adx_strength": round(adx_val, 2),
+                                "ema_8": round(ema_8, 2), 
+                                "ema_21": round(ema_21, 2),
+                                "sma_50": round(sma_50, 2)  
                             })
                         
             if is_pullback: 
