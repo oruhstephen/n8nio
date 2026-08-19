@@ -60,42 +60,29 @@ def get_mcap_tier(mcap):
 def get_swing_universe():
     print("\n--- BOOTING CONSISTENCY & PULLBACK SCREENER ---")
     try:
-        print(f"Scanning for US stocks with Market Cap >= ${MIN_MARKET_CAP:,}, "
-              f"Avg Vol >= {MIN_AVG_VOLUME:,}, Price >= ${MIN_PRICE}...")
-        
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
             EquityQuery('gte', ['intradaymarketcap', MIN_MARKET_CAP]),
             EquityQuery('gte', ['avgdailyvol3m', MIN_AVG_VOLUME]),
             EquityQuery('gt',  ['intradayprice', MIN_PRICE])
         ])
+        response = yf.screen(q, sortField='intradaymarketcap', sortAsc=False)
+        quotes = response.get('quotes', [])
         
         symbols = []
         symbol_map = {}
         
-        # --- PAGINATION LOOP ---
-        # Yahoo maxes out at 250 results per call. We loop with an offset to reach 1000.
-        for offset in [0, 250, 500, 750]:
-            response = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, size=250, offset=offset)
-            quotes = response.get('quotes', [])
-            
-            if not quotes:
-                break # Stop if Yahoo runs out of matching stocks
+        for item in quotes:
+            sym = item.get("symbol")
+            if sym:
+                symbols.append(sym)
+                symbol_map[sym] = item.get("shortName", sym) 
                 
-            for item in quotes:
-                sym = item.get("symbol")
-                if sym and sym not in symbols:
-                    symbols.append(sym)
-                    symbol_map[sym] = item.get("shortName", sym) 
-                
-        # Enforce our hard limit
         symbols = symbols[:UNIVERSE_SIZE]
         
-        # --- DYNAMIC ETF NAME FETCHING ---
         print(f"Fetching dynamic metadata for {len(INDEX_BENCHMARKS)} benchmark ETFs...")
         for etf in INDEX_BENCHMARKS:
-            if etf not in symbols: 
-                symbols.append(etf)
+            if etf not in symbols: symbols.append(etf)
             try:
                 etf_info = yf.Ticker(etf).info
                 symbol_map[etf] = etf_info.get('shortName', etf)
@@ -104,7 +91,6 @@ def get_swing_universe():
                 
         print(f"Found {len(symbols)} targets (including {len(INDEX_BENCHMARKS)} ETFs). Downloading data...")
         return symbols, symbol_map
-        
     except Exception as e:
         print(f"API screener failed: {e}")
         sys.exit(1)
@@ -305,7 +291,7 @@ def run_macro_analysis():
                                 "estimated_gain_pct": round(upside_to_swing_high_pct, 2),
                                 "recommended_stop_loss": round(stop_loss_pb, 2),
                                 "reward_risk_ratio": round((upside_to_swing_high_pct / risk_pct_pb), 2),
-                                "ema_21": round(ema_21, 2),
+                                "ema_21": round(ema_21, 2),   
                                 "sma_50": round(sma_50, 2)
                             })
 
@@ -341,9 +327,9 @@ def run_macro_analysis():
                                 "recommended_stop_loss": round(stop_loss_mom, 2),
                                 "green_days_last_5": green_days_5d,
                                 "adx_strength": round(adx_val, 2),
-                                "ema_8": round(ema_8, 2),
+                                "ema_8": round(ema_8, 2), 
                                 "ema_21": round(ema_21, 2),
-                                "sma_50": round(sma_50, 2)
+                                "sma_50": round(sma_50, 2)  
                             })
                         
             if is_pullback: 
