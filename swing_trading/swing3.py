@@ -21,14 +21,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER PARAMETERS ---
-MIN_MARKET_CAP = 2_000_000_000      # $2B+ Market Cap
+MIN_MARKET_CAP = 500_000_000      # $500M+ Market Cap
 MIN_AVG_VOLUME = 1_000_000          # 1M+ shares/day average volume
 MIN_PRICE = 10.00                   # $10.00 Minimum price
-UNIVERSE_SIZE = 150                 # Top 150 largest caps scanned weekly
+UNIVERSE_SIZE = 1000                 # Top 1000 largest caps scanned weekly
 
 # --- QUANTITATIVE LOGIC GATES ---
 MAX_EXTENSION_PCT = 15.0            # Gate 2: Don't chase >15% above 50-SMA
-PULLBACK_LOW, PULLBACK_HIGH = -1.5, 3.0   # Gate 3: Distance band around 21-EMA (%)
+PULLBACK_LOW, PULLBACK_HIGH = -2.5, 3.0   # Gate 3: Distance band around 21-EMA (%)
 MIN_UPSIDE_TO_HIGH_PCT = 5.0        # Gate 4: Minimum upside potential to 20d high
 
 # --- RISK & VOLATILITY FILTERS ---
