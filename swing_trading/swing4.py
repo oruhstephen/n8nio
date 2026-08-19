@@ -209,6 +209,14 @@ def run_macro_analysis():
             sma_200 = df['200_SMA'].iloc[-1]
             atr = df['ATR'].iloc[-1]
             adx_val = df['ADX'].iloc[-1]
+
+            # --- ALIGNMENT STATE EVALUATION (NEW) ---
+            if ema_8 > ema_21 and ema_21 > sma_50 and sma_50 > sma_200:
+                trend_alignment = "Bullish"
+            elif ema_8 < ema_21 and ema_21 < sma_50 and sma_50 < sma_200:
+                trend_alignment = "Bearish"
+            else:
+                trend_alignment = "Mixed"
             
             daily_returns = df['Close'].pct_change() * 100
             last_5_returns = daily_returns.tail(5)
@@ -296,6 +304,7 @@ def run_macro_analysis():
                                 "symbol": sym,
                                 "company_name": company_name,
                                 "market_cap_tier": get_mcap_tier(mcap),
+                                "trend_alignment": trend_alignment,
                                 "signal_timestamp": scan_timestamp,
                                 "action": "BUY",
                                 "current_price": round(current_price, 2),
@@ -331,6 +340,7 @@ def run_macro_analysis():
                                 "symbol": sym,
                                 "company_name": company_name,
                                 "market_cap_tier": get_mcap_tier(mcap),
+                                "trend_alignment": trend_alignment,
                                 "signal_timestamp": scan_timestamp,
                                 "action": "BUY",
                                 "current_price": round(current_price, 2),
@@ -347,9 +357,9 @@ def run_macro_analysis():
                             })
                         
             if is_pullback: 
-                print(f" -> [PULLBACK] {sym} | R:R: {upside_to_swing_high_pct / risk_pct_pb:.2f} | Est. Gain: +{upside_to_swing_high_pct:.1f}%")
+                print(f" -> [PULLBACK] {sym} | R:R: {upside_to_swing_high_pct / risk_pct_pb:.2f} | Est. Gain: +{upside_to_swing_high_pct:.1f}% | Align: {trend_alignment}")
             if is_momentum: 
-                print(f" -> [MOMENTUM] {sym} | ADX: {adx_val:.1f} | Est. Gain (2R Target): +{momentum_estimated_gain_pct:.1f}%")
+                print(f" -> [MOMENTUM] {sym} | ADX: {adx_val:.1f} | Est. Gain (2R Target): +{momentum_estimated_gain_pct:.1f}% | Align: {trend_alignment}")
 
         except Exception as e: continue
 
