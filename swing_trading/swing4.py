@@ -19,7 +19,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER PARAMETERS ---
-MIN_MARKET_CAP = 500_000_000        
+MIN_MARKET_CAP = 2_000_000_000        
 MIN_AVG_VOLUME = 1_000_000          
 MIN_PRICE = 10.00                   
 UNIVERSE_SIZE = 1000                
