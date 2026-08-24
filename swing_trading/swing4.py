@@ -20,7 +20,7 @@ SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER PARAMETERS ---
 MIN_MARKET_CAP = 2_000_000_000        
-MIN_AVG_VOLUME = 1_000_000          
+MIN_AVG_VOLUME = 250_000          
 MIN_PRICE = 10.00                   
 UNIVERSE_SIZE = 1000                
 
@@ -35,10 +35,10 @@ ATR_STOP_MULTIPLIER = 1.5
 MIN_REWARD_RISK_RATIO = 1.5         
 
 # --- STRATEGY 2: CONSISTENT MOMENTUM GATES ---
-MIN_RVOL_MOMENTUM = 1.2             
-MIN_ADX = 25.0                      
+MIN_RVOL_MOMENTUM = 1.0             
+MIN_ADX = 20.0                      
 BREAKOUT_PROXIMITY_PCT = -2.0       
-MIN_GREEN_DAYS_5D = 4               
+MIN_GREEN_DAYS_5D = 3               
 MAX_SINGLE_DAY_JUMP_PCT = 10.0      
 
 # --- SHARED FILTERS & STATE ---
