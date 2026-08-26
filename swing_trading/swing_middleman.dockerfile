@@ -8,7 +8,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir websockets datetime requests pandas numpy websocket-client finnhub-python yfinance        
 
 # Copy the actual script
-COPY /swing_trading/swing4.py .
+COPY /swing_trading/swing5.py .
 
 # Run the script permanently
-CMD ["python", "swing4.py"]
+CMD ["python", "swing5.py"]
