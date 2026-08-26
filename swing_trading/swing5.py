@@ -127,9 +127,10 @@ def clean_old_seen_symbols(seen):
     cutoff = datetime.now() - timedelta(days=DEDUP_WINDOW_DAYS)
     return {sym: d for sym, d in seen.items() if datetime.fromisoformat(d) > cutoff}
 
-def recently_alerted(symbol, seen):
-    if symbol not in seen: return False
-    return (datetime.now() - datetime.fromisoformat(seen[symbol])) < timedelta(days=DEDUP_WINDOW_DAYS)
+def recently_alerted(symbol, strategy_prefix, seen):
+    key = f"{strategy_prefix}_{symbol}"
+    if key not in seen: return False
+    return (datetime.now() - datetime.fromisoformat(seen[key])) < timedelta(days=DEDUP_WINDOW_DAYS)
 
 def has_upcoming_earnings(symbol, blackout_days=EARNINGS_BLACKOUT_DAYS):
     if symbol in INDEX_BENCHMARKS: return False
