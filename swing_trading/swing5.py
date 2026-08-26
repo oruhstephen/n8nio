@@ -165,7 +165,7 @@ def run_macro_analysis():
     uk_time = datetime.now(ZoneInfo("Europe/London"))
     scan_timestamp = uk_time.strftime("%Y-%m-%d %H:%M:%S BST")
 
-    print("\n--- INITIATING ALGORITHMIC FILTERS & BENCHMARKING ---")
+    print("\n--- INITIATING ALGORITHMIC FILTERS & BENCHMARKING @ {scan_timestamp} ---")
     for sym in symbols:
         try:
             try:
