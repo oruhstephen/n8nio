@@ -19,10 +19,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER PARAMETERS ---
-MIN_MARKET_CAP = 2_000_000_000        
+MIN_MARKET_CAP = 500_000_000        
 MIN_AVG_VOLUME = 250_000          
 MIN_PRICE = 10.00                   
-UNIVERSE_SIZE = 1000                
+UNIVERSE_SIZE = 2000                
 
 # --- BENCHMARK ETFS (Indexes & Sectors) ---
 INDEX_BENCHMARKS = ["SPY", "QQQ", "IWM", "XLK", "XLF"]
@@ -35,13 +35,13 @@ ATR_STOP_MULTIPLIER = 1.5
 MIN_REWARD_RISK_RATIO = 1.5         
 
 # --- STRATEGY 2: CONSISTENT MOMENTUM GATES ---
-MIN_RVOL_MOMENTUM = 1.0             
-MIN_ADX = 20.0                      
+MIN_RVOL_MOMENTUM = 1.2             # Require slightly elevated volume for momentum validation
+MIN_ADX = 20.0                      # Institutional threshold for a strong established trend
 BREAKOUT_PROXIMITY_PCT = -3.0       
-MIN_GREEN_DAYS_5D = 2               
-MAX_SINGLE_DAY_JUMP_PCT = 40.0      
+MIN_GREEN_DAYS_5D = 3               # Demand structural consistency
+MAX_ATR_JUMP_MULTIPLIER = 3.0       # (NEW) Dynamic exhaust limit: max 3x normal ATR jump
 
-# --- STRATEGY 3: OVERNIGHT GAP & GO GATES (NEW) ---
+# --- STRATEGY 3: OVERNIGHT GAP & GO GATES ---
 GAP_MIN_RVOL = 1.5                  # Needs heavy accumulation today
 GAP_MIN_CLOSE_RANGE = 0.90          # Must close in the top 10% of its daily range
 GAP_MIN_DAY_PCT = 3.0               # Stock must be up at least 3% on the day
@@ -50,7 +50,7 @@ GAP_ATR_STOP = 0.5                  # Tight stop for gap setups (0.5x ATR below 
 # --- SHARED FILTERS & STATE ---
 EARNINGS_BLACKOUT_DAYS = 7          
 DEDUP_WINDOW_DAYS = 21              
-GAP_THRESHOLD_PCT = 5.0             
+MAX_ATR_GAP_MULTIPLIER = 1.5        # (NEW) Dynamic exhaustion limit: ignore gaps larger than 1.5x ATR             
 
 # ==========================================
 # HELPER FUNCTIONS & STATE
@@ -79,7 +79,7 @@ def get_swing_universe():
         symbols = []
         symbol_map = {}
         
-        for offset in [0, 250, 500, 750]:
+        for offset in range(0, UNIVERSE_SIZE, 250):
             response = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, size=250, offset=offset)
             quotes = response.get('quotes', [])
             
@@ -160,13 +160,14 @@ def run_macro_analysis():
     
     dynamic_benchmarks = {
         "pullback": {"symbol": "N/A", "5d_return": -999, "metrics": {}},
-        "momentum": {"symbol": "N/A", "5d_return": -999, "metrics": {}}
+        "momentum": {"symbol": "N/A", "5d_return": -999, "metrics": {}},
+        "gap": {"symbol": "N/A", "today_change": -999, "metrics": {}}
     }
     
     uk_time = datetime.now(ZoneInfo("Europe/London"))
     scan_timestamp = uk_time.strftime("%Y-%m-%d %H:%M:%S BST")
 
-    print("\n--- INITIATING ALGORITHMIC FILTERS & BENCHMARKING @ {scan_timestamp} ---")
+    print(f"\n--- INITIATING ALGORITHMIC FILTERS & BENCHMARKING @ {scan_timestamp} ---")
     for sym in symbols:
         try:
             try:
@@ -213,6 +214,11 @@ def run_macro_analysis():
             atr = df['ATR'].iloc[-1]
             adx_val = df['ADX'].iloc[-1]
 
+            # --- DYNAMIC VOLATILITY METRICS (NEW) ---
+            atr_pct = (atr / current_price) * 100
+            dynamic_max_jump_pct = MAX_ATR_JUMP_MULTIPLIER * atr_pct
+            dynamic_max_gap_pct = MAX_ATR_GAP_MULTIPLIER * atr_pct
+
             if ema_8 > ema_21 and ema_21 > sma_50 and sma_50 > sma_200:
                 trend_alignment = "Bullish"
             elif ema_8 < ema_21 and ema_21 < sma_50 and sma_50 < sma_200:
@@ -236,7 +242,7 @@ def run_macro_analysis():
             dist_21 = ((current_price - ema_21) / ema_21) * 100
             ext_50 = ((current_price - sma_50) / sma_50) * 100
             
-            # --- GAP METRICS (NEW) ---
+            # --- GAP METRICS ---
             high_today = df['High'].iloc[-1]
             low_today = df['Low'].iloc[-1]
             intraday_range = high_today - low_today
@@ -258,7 +264,7 @@ def run_macro_analysis():
 
             # --- DYNAMIC BENCHMARKING ---
             if ret_5d > dynamic_benchmarks["momentum"]["5d_return"] and current_price > sma_200:
-                if max_daily_jump_5d <= MAX_SINGLE_DAY_JUMP_PCT: 
+                if max_daily_jump_5d <= dynamic_max_jump_pct: # Uses ATR instead of static limit
                     dynamic_benchmarks["momentum"] = {
                         "symbol": sym, "5d_return": ret_5d,
                         "metrics": {
@@ -286,10 +292,26 @@ def run_macro_analysis():
                         }
                     }
 
+            # --- ADDED: GAP LEADER LOGIC ---
+            if today_change_pct > dynamic_benchmarks["gap"]["today_change"]:
+                # Ensure the leader actually qualifies as a high-quality gap setup
+                if rvol >= GAP_MIN_RVOL and close_range_position >= GAP_MIN_CLOSE_RANGE:
+                    dynamic_benchmarks["gap"] = {
+                        "symbol": sym, "today_change": today_change_pct,
+                        "metrics": {
+                            "symbol": sym, 
+                            "company_name": company_name,
+                            "today_change_pct": round(today_change_pct, 2),
+                            "rvol": round(rvol, 2),
+                            "close_range_position_pct": round(close_range_position * 100, 1)
+                        }
+                    }
+
             # Pre-evaluate constraints
-            is_recent_alert = recently_alerted(sym, seen)
+            is_recent_swing = recently_alerted(sym, "SWING", seen)
+            is_recent_gap = recently_alerted(sym, "GAP", seen)
             pending_earnings = has_upcoming_earnings(sym)
-            recent_gap = abs((today_open - prev_close) / prev_close) * 100 > GAP_THRESHOLD_PCT
+            recent_gap = abs((today_open - prev_close) / prev_close) * 100 > dynamic_max_gap_pct # Uses dynamic ATR limit
             is_above_200 = (sma_50 > sma_200 and current_price > sma_200)
 
             is_pullback = False
@@ -300,8 +322,7 @@ def run_macro_analysis():
             except: mcap = 0
             
             # --- STRATEGY 1 & 2 GATES (SWING TRADING) ---
-            # Swing trades require no recent gaps, no pending earnings, and trend alignment
-            if is_above_200 and not recent_gap and not pending_earnings and not is_recent_alert:
+            if is_above_200 and not recent_gap and not pending_earnings and not is_recent_swing:
                 
                 # STRATEGY 1: PULLBACK LOGIC
                 if ext_50 <= MAX_EXTENSION_PCT and PULLBACK_LOW <= dist_21 <= PULLBACK_HIGH:
@@ -332,13 +353,14 @@ def run_macro_analysis():
 
                 # STRATEGY 2: CONSISTENT MOMENTUM LOGIC
                 if dist_to_high_pct >= BREAKOUT_PROXIMITY_PCT and current_price > ema_8 > ema_21:
-                    if green_days_5d >= MIN_GREEN_DAYS_5D and max_daily_jump_5d <= MAX_SINGLE_DAY_JUMP_PCT:
+                    if green_days_5d >= MIN_GREEN_DAYS_5D and max_daily_jump_5d <= dynamic_max_jump_pct: # Uses ATR limit
                         if rvol >= MIN_RVOL_MOMENTUM and adx_val >= MIN_ADX:
                             stop_loss_mom = ema_8 - (0.5 * atr)
                             risk_pct_mom = ((current_price - stop_loss_mom) / current_price) * 100
                             if risk_pct_mom > 0 and not is_pullback:
                                 risk_amount = current_price - stop_loss_mom
                                 momentum_target_price = current_price + (risk_amount * 2.0)
+                                momentum_estimated_gain_pct = ((momentum_target_price - current_price) / current_price) * 100
                                 is_momentum = True
                                 momentum_setups.append({
                                     "symbol": sym,
@@ -361,8 +383,7 @@ def run_macro_analysis():
                                 })
 
             # --- STRATEGY 3: OVERNIGHT GAP & GO (DAY TRADE SETUP) ---
-            # Gap setups ignore the 200_SMA constraint, but still avoid binary earnings reports
-            if not pending_earnings and not is_recent_alert:
+            if not pending_earnings and not is_recent_gap:
                 if today_change_pct >= GAP_MIN_DAY_PCT:
                     if rvol >= GAP_MIN_RVOL and close_range_position >= GAP_MIN_CLOSE_RANGE:
                         if is_fresh_breakout:
@@ -398,7 +419,6 @@ def run_macro_analysis():
     if total_setups > 0:
         top_pullbacks = sorted(pullback_setups, key=lambda x: x['reward_risk_ratio'], reverse=True)[:3]
         top_momentums = sorted(momentum_setups, key=lambda x: x['adx_strength'], reverse=True)[:3]
-        # Sort Gap setups by how close they are to the absolute high of day, then by volume
         top_gaps = sorted(gap_setups, key=lambda x: (x['close_range_position_pct'], x['rvol']), reverse=True)[:3]
         
         payload = {
@@ -412,6 +432,7 @@ def run_macro_analysis():
                 "dynamic_leaders_last_5_days": {
                     "pullback_leader": dynamic_benchmarks["pullback"]["metrics"],
                     "consistent_momentum_leader": dynamic_benchmarks["momentum"]["metrics"]
+                    "gap_leader": dynamic_benchmarks["gap"]["metrics"]
                 }
             }
         }
@@ -422,8 +443,13 @@ def run_macro_analysis():
             response = requests.post(N8N_SWING_WEBHOOK_URL, json=payload)
             if response.status_code == 200:
                 print("Webhook successful! Saving deduplication state to volume...")
-                for setup in top_pullbacks + top_momentums + top_gaps:
-                    seen[setup["symbol"]] = datetime.now().isoformat()
+                
+                for setup in top_pullbacks + top_momentums:
+                    seen[f"SWING_{setup['symbol']}"] = datetime.now().isoformat()
+                    
+                for setup in top_gaps:
+                    seen[f"GAP_{setup['symbol']}"] = datetime.now().isoformat()
+                    
                 save_seen_symbols(seen)
             else:
                 print(f"Warning: Webhook failed (HTTP {response.status_code}). State NOT saved.")
