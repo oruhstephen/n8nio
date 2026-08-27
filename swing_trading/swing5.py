@@ -431,7 +431,7 @@ def run_macro_analysis():
                 "market_indices": index_metrics,
                 "dynamic_leaders_last_5_days": {
                     "pullback_leader": dynamic_benchmarks["pullback"]["metrics"],
-                    "consistent_momentum_leader": dynamic_benchmarks["momentum"]["metrics"]
+                    "consistent_momentum_leader": dynamic_benchmarks["momentum"]["metrics"],
                     "gap_leader": dynamic_benchmarks["gap"]["metrics"]
                 }
             }
