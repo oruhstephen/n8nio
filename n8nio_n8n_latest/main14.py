@@ -84,7 +84,7 @@ def get_morning_watchlist():
             EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]), 
             EquityQuery('gt',  ['intradayprice', 1.00]),           
             EquityQuery('gte', ['percentchange', 3.0]),            
-            EquityQuery('gte', ['avgdailyvol3m', 250000])          
+            EquityQuery('gte', ['avgdailyvol3m', 1000000])          
         ])
 
         response = yf.screen(q, sortField='percentchange', sortAsc=False)
