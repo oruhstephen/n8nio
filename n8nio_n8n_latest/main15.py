@@ -4,12 +4,16 @@ import requests
 import time
 import threading
 import sys
+import warnings  # <--- ADD
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from yfinance import EquityQuery
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# Silence internal yfinance / pandas deprecation warnings
+warnings.filterwarnings('ignore')  # <--- ADD
 
 # ==========================================
 # CONFIGURATION & INSTITUTIONAL PARAMETERS
