@@ -35,7 +35,7 @@ MAX_FLOAT_SHARES = 50_000_000
 ENABLE_FLOAT_FILTER = False
 DEBUG_PRINT_QUOTE_FIELDS = False
 
-# Maximum duration (in seconds) an under-VWAP dip remains valid for a reclaim (extended to 30 mins)
+# Maximum duration (in seconds) an under-VWAP dip remains valid for a reclaim (30 mins)
 MAX_DIP_AGE_SECONDS = 1800
 
 # --- DEEP PULLBACK / HOD-RECLAIM SIGNAL ---
@@ -585,10 +585,11 @@ def evaluation_loop():
         time.sleep(60)
         current_time = time.time()
         triggered_symbols = []
+        log_entries = []
 
         uk_time = datetime.now(ZoneInfo("Europe/London"))
         timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n--- {timestamp_str} | 60-SECOND ALGORITHMIC VWAP SCANS ---")
+        print(f"\n--- {timestamp_str} | 60-SECOND ALGORITHMIC VWAP SCANS (RANKED BY SCORE) ---")
         
         with data_lock:
             for sym, metrics in market_data.items():
@@ -707,12 +708,16 @@ def evaluation_loop():
                         vwap_20d_dist_pct=vwap_20d_dist_pct
                     )
 
-                    print(f"[{sym}] {p_change:+.2f}% | Score: {setup_score:.1f} ({setup_class}) | "
-                          f"PrevDay: {metrics['prev_day_trend']} | Align: {alignment} | "
-                          f"7D: {metrics['trend_7d']} ({metrics['green_red_7d']}) | "
-                          f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
-                          f"CLV: {intraday_clv_pct:.1f}% | ADR: {metrics['adr_pct']:.2f}% ({adr_feasibility}) | "
-                          f"Up2HOD: {upside_potential:.2f}% | Streak: {metrics['reclaim_streak']}")
+                    # Store for score-sorted console display
+                    formatted_line = (
+                        f"[{sym:<5}] {p_change:>+6.2f}% | Score: {setup_score:>4.1f} ({setup_class:<8}) | "
+                        f"PrevDay: {metrics['prev_day_trend']:<14} | Align: {alignment:<12} | "
+                        f"7D: {metrics['trend_7d']:<7} ({metrics['green_red_7d']:<7}) | "
+                        f"Delta: {order_flow_delta_pct:>+5.1f}% | VWAPDist: {vwap_distance:>+5.2f}% | "
+                        f"CLV: {intraday_clv_pct:>+5.1f}% | ADR: {metrics['adr_pct']:>4.2f}% ({adr_feasibility:<18}) | "
+                        f"Up2HOD: {upside_potential:>5.2f}% | Streak: {metrics['reclaim_streak']}"
+                    )
+                    log_entries.append((setup_score, formatted_line))
 
                     def build_signal_payload(signal_type_str, pb_tier_str, sl_price):
                         return {
@@ -801,7 +806,7 @@ def evaluation_loop():
                     # ==============================================================
                     elif (pullback_tier is not None and
                           alignment in ("FULL_BULLISH", "COMPRESSION") and  
-                          cum_vol >= 100000 and rvol_ok and  # Fixed fail-open liquidity floor
+                          cum_vol >= 100000 and rvol_ok and
                           vwap_distance < 0 and 
                           distance_from_low_pct >= 1.0 and 
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
@@ -809,7 +814,6 @@ def evaluation_loop():
                           not pullback_in_cooldown):
 
                         metrics["last_pullback_alert_time"] = current_time
-                        # Safe base low price prevents negative stop losses
                         base_low = metrics["session_low_price"] if metrics["session_low_price"] > 0 else current_price
                         reversal_sl_buffer = max(0.04, base_low * 0.02)
                         reversal_stop_loss_price = base_low - reversal_sl_buffer
@@ -837,6 +841,12 @@ def evaluation_loop():
                         )
 
                 metrics["price_60s_ago"] = current_price
+
+        # Print all lines sorted by setup_score descending
+        if log_entries:
+            log_entries.sort(key=lambda x: x[0], reverse=True)
+            for _, line in log_entries:
+                print(line)
 
         if triggered_symbols:
             triggered_symbols = sorted(triggered_symbols, key=lambda x: x["setup_score"], reverse=True)
