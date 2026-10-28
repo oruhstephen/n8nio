@@ -23,15 +23,20 @@ ALERT_COOLDOWN_SECONDS = 900
 # Re-scan market every 30 minutes (1800 seconds) to catch mid-day breakout runners
 REFRESH_INTERVAL_SECONDS = 1800
 
-# Reject any single trade print that implies a larger % move from the previous trade
+# Reject any single trade print that implies an unrealistic jump from the previous tick
 MAX_TICK_MOVE_PCT = 20.0
 
 # Screener parameters
 MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
-MIN_RELATIVE_VOLUME = 1.5
+MIN_RELATIVE_VOLUME = 1.2                   # Permissive floor to allow recovering pullbacks
+MIN_CHANGE_PCT = -10.0                      # Captures deep pullbacks and recovering dip setups
+MAX_WATCHLIST_SYMBOLS = 40                  # Sliced to 40 for Finnhub WebSocket cap & sub-ms loop latency
 MAX_FLOAT_SHARES = 50_000_000
 ENABLE_FLOAT_FILTER = False
 DEBUG_PRINT_QUOTE_FIELDS = False
+
+# Maximum duration (in seconds) an under-VWAP dip remains valid for a reclaim (extended to 30 mins)
+MAX_DIP_AGE_SECONDS = 1800
 
 # --- DEEP PULLBACK / HOD-RECLAIM SIGNAL ---
 DEEP_PULLBACK_TIERS = [
@@ -44,8 +49,8 @@ RECLAIM_HOD_PROXIMITY_PCT = 3.0
 RECLAIM_MIN_STREAK = 2
 RECLAIM_MIN_ORDER_FLOW_DELTA_PCT = 20.0
 
-# Shared thread-safe state
-data_lock = threading.Lock()
+# Re-entrant Lock prevents self-deadlock when the refresher calls register_symbol_in_memory
+data_lock = threading.RLock()
 market_data = {}
 ws_global = None
 
@@ -91,7 +96,6 @@ def calculate_relative_volume(day_volume, avg_vol_3m):
 
 
 def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
-    """Checks whether the upside to HOD is realistic relative to the stock's 21-day ADR %."""
     if not adr_pct or adr_pct <= 0:
         return 0.0, "Unknown ADR"
 
@@ -108,6 +112,64 @@ def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
     return target_vs_adr_pct, feasibility
 
 
+def score_morning_setup(target: dict) -> tuple[float, str]:
+    """
+    Dedicated Pre-Market Structural Scoring (0-100 scale).
+    Scores based strictly on verifiable historical data before live trading prints exist.
+    """
+    score = 0.0
+
+    # 1. Historical Volatility Runway (Max 30 pts)
+    score += min(target.get("adr_pct", 0.0), 12.0) * 2.5
+
+    # 2. Early Relative Volume Interest (Max 25 pts)
+    rvol = target.get("relative_volume") or 1.0
+    score += min(rvol, 10.0) * 2.5
+
+    # 3. 7-Day Trend Consistency (Max 20 pts)
+    trend_7d = target.get("trend_7d", "Neutral")
+    if trend_7d == "Bullish":
+        score += 20.0
+    elif trend_7d == "Neutral":
+        score += 10.0
+
+    # 4. Moving Average Alignment (Max 25 pts)
+    alignment = target.get("alignment_state", "MIXED")
+    if alignment == "FULL_BULLISH":
+        score += 25.0
+    elif alignment == "COMPRESSION":
+        score += 20.0
+    elif target.get("macro_uptrend", False):
+        score += 10.0
+
+    # --- Structural Penalties ---
+    c_price = target.get("regularMarketPrice", 0)
+    ma_5 = target.get("ma_5", 0)
+    if ma_5 > 0 and ((c_price - ma_5) / ma_5 * 100.0) >= 35.0:
+        score -= 15.0
+
+    if target.get("daily_rsi", 50.0) > 85.0:
+        score -= 15.0
+
+    if abs(target.get("gap_pct", 0.0)) > 15.0:
+        score -= 8.0
+
+    final_score = max(0.0, min(100.0, round(score, 1)))
+
+    if final_score >= 75.0:
+        setup_class = "Top-tier"
+    elif final_score >= 60.0:
+        setup_class = "Strong"
+    elif final_score >= 45.0:
+        setup_class = "Watch"
+    elif final_score >= 30.0:
+        setup_class = "Low"
+    else:
+        setup_class = "Avoid"
+
+    return final_score, setup_class
+
+
 def score_intraday_setup(
     metrics: dict,
     live_rvol: float,
@@ -116,17 +178,12 @@ def score_intraday_setup(
     target_vs_adr_pct: float,
     extension_pct: float,
     vwap_20d_dist_pct: float
-):
-    """
-    Composite 0-100 Setup Score (Hybrid Model):
-    Combines Order Flow Delta, RVOL, Intraday CLV, 7D/Daily Trend, and ADR Headroom,
-    with penalties for unrealistic ADR targets, 20D VWAP overextension, RSI > 85, and large overnight gaps.
-    """
+) -> tuple[float, str]:
     score = 0.0
 
     # Component A: Order Flow Aggression / Volatility Headroom (Max 30 pts)
-    score += min(max(order_flow_delta_pct, 0.0), 30.0) * 0.6  # Up to 18 pts from Delta
-    score += min(metrics.get("adr_pct", 0.0), 12.0) * 1.0     # Up to 12 pts from ADR %
+    score += min(max(order_flow_delta_pct, 0.0), 30.0) * 0.6
+    score += min(metrics.get("adr_pct", 0.0), 12.0) * 1.0
 
     # Component B: Relative Volume / Flow Interest (Max 20 pts)
     rvol_val = live_rvol if (live_rvol and live_rvol > 0) else (metrics.get("relative_volume") or 1.0)
@@ -149,19 +206,13 @@ def score_intraday_setup(
     elif metrics.get("macro_uptrend", False):
         score += 10.0
 
-    # Penalty 1: Volatility Feasibility Penalty (Requires > 1.8x historical ADR)
+    # Penalties
     if target_vs_adr_pct > 180.0:
         score -= 12.0
-
-    # Penalty 2: Overextended from 20D Institutional VWAP (> 40%) or 5D MA (> 35%)
     if vwap_20d_dist_pct > 40.0 or extension_pct >= 35.0:
         score -= 15.0
-
-    # Penalty 3: Severe Overbought Daily RSI (> 85)
     if metrics.get("daily_rsi", 50.0) > 85.0:
         score -= 15.0
-
-    # Penalty 4: Exhaustion Overnight Gap (> 15%)
     if abs(metrics.get("gap_pct", 0.0)) > 15.0:
         score -= 8.0
 
@@ -182,41 +233,39 @@ def score_intraday_setup(
 
 
 # ==========================================
-# PHASE 1: YAHOO NATIVE API SCREENER
+# PHASE 1: SCREENER (HARVEST 500 -> SHORTLIST 100 -> SCORE -> SLICE 40)
 # ==========================================
 def get_morning_watchlist():
-    print("\n--- SCREENING MARKET FOR MOMENTUM TARGETS ---")
+    print("\n--- SCREENING MARKET: HARVEST 500 -> SHORTLIST 100 -> SCORE ALL -> SLICE 40 ---")
     try:
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
-            EquityQuery('gte', ['intradaymarketcap', 60000000]),      
+            EquityQuery('gte', ['intradaymarketcap', 60_000_000]),      
             EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]), 
             EquityQuery('gt',  ['intradayprice', 1.00]),           
-            EquityQuery('gte', ['percentchange', -5.0]),            
-            EquityQuery('gte', ['avgdailyvol3m', 2000000])          
+            EquityQuery('gte', ['percentchange', MIN_CHANGE_PCT]),  # >= -10.0%
+            EquityQuery('gte', ['avgdailyvol3m', 1_000_000])          
         ])
 
-        response = yf.screen(q, sortField='percentchange', sortAsc=False)
-        quotes = response.get('quotes', [])
-        qualified_symbols = []
+        quotes = []
+        for offset in (0, 250):
+            try:
+                resp = yf.screen(q, sortField='dayvolume', sortAsc=False, size=250, offset=offset)
+                batch = resp.get('quotes', [])
+                quotes.extend(batch)
+                if len(batch) < 250:
+                    break
+            except Exception as e:
+                print(f"  [WARN] Screen failed at offset {offset}: {e}")
+
+        print(f"Harvested {len(quotes)} raw quotes across 2 pages.")
+
+        harvest_pool = []
         rel_vol_unavailable_count = 0
 
-        if DEBUG_PRINT_QUOTE_FIELDS and quotes:
-            sample = quotes[0]
-            print(f"\n  [DEBUG] Raw quote keys for {sample.get('symbol', '?')} "
-                  f"({len(sample)} fields):")
-            for key in sorted(sample.keys()):
-                print(f"    {key}: {sample[key]!r}")
-            has_avg_vol_3m = "averageDailyVolume3Month" in sample
-            print(f"  [DEBUG] 'averageDailyVolume3Month' present: {has_avg_vol_3m}")
-            if not has_avg_vol_3m:
-                close_matches = [k for k in sample.keys() if "volume" in k.lower() or "vol" in k.lower()]
-                print(f"  [DEBUG] Volume-related keys found instead: {close_matches}")
-            print()
-
         for quote in quotes:
-            sym = quote.get("symbol")
-            if not sym:
+            raw_sym = quote.get("symbol")
+            if not raw_sym:
                 continue
 
             prev_close = quote.get("regularMarketPreviousClose", 0)
@@ -229,28 +278,33 @@ def get_morning_watchlist():
             fifty_day_avg = quote.get("fiftyDayAverage", 0)
             avg_vol_3m = quote.get("averageDailyVolume3Month", 0) or quote.get("avgdailyvol3m", 0)
 
-            # 5-Tier Market Cap Classification
             raw_market_cap = quote.get("marketCap", 0)
             cap_tier = get_mcap_tier(raw_market_cap)
 
-            # Overnight Gap % (Open vs Prev Close)
             gap_pct = ((open_price - prev_close) / prev_close * 100.0) if (prev_close and prev_close > 0 and open_price and open_price > 0) else 0.0
 
             relative_volume = calculate_relative_volume(day_volume, avg_vol_3m)
-            if relative_volume is None:
+
+            if relative_volume is not None and relative_volume < MIN_RELATIVE_VOLUME:
+                continue
+            elif relative_volume is None:
                 rel_vol_unavailable_count += 1
-            elif relative_volume < MIN_RELATIVE_VOLUME:
-                continue  # trading at/below its typical pace for this time of day - skip
 
             macro_uptrend = (current_price > fifty_day_avg and fifty_day_avg > 0)
             typical_price = current_price
             if (day_high + day_low + current_price) > 0:
-                typical_price = (day_high + day_low + current_price) / 3
+                typical_price = (day_high + day_low + current_price) / 3.0
                 
             seed_dollar_traded = typical_price * day_volume
 
-            qualified_symbols.append({
-                "symbol": sym,
+            range_span = day_high - day_low
+            intraday_location = ((current_price - day_low) / range_span) if range_span > 0 else 0.5
+            rvol_mult = relative_volume if relative_volume is not None else 1.0
+            activity_score = rvol_mult * (0.5 + intraday_location)
+
+            harvest_pool.append({
+                "symbol": raw_sym,
+                "finnhub_symbol": raw_sym.replace('-', '.'),
                 "prev_close": prev_close,
                 "open_price": open_price if open_price > 0 else current_price,
                 "gap_pct": round(gap_pct, 2),
@@ -264,148 +318,216 @@ def get_morning_watchlist():
                 "fifty_day_avg": fifty_day_avg,
                 "macro_uptrend": macro_uptrend,
                 "regularMarketPrice": current_price,
-                "relative_volume": relative_volume
+                "relative_volume": relative_volume,
+                "activity_score": activity_score
             })
 
         if rel_vol_unavailable_count:
-            print(f"  [WARN] Relative volume unavailable for {rel_vol_unavailable_count} "
-                  f"quote(s) - those candidates were NOT filtered on RVOL. Check "
-                  f"'averageDailyVolume3Month' against a raw quote dict if this "
-                  f"count is high (set DEBUG_PRINT_QUOTE_FIELDS = True).")
+            print(f"  [WARN] RVOL data unavailable for {rel_vol_unavailable_count} candidate(s); allowed through as fail-open.")
 
-        if ENABLE_FLOAT_FILTER and qualified_symbols:
-            candidate_pool = qualified_symbols[:60]
-            float_filtered = []
-            debug_shown = False
-            for cand in candidate_pool:
-                try:
-                    info = yf.Ticker(cand["symbol"]).info
-                    if DEBUG_PRINT_QUOTE_FIELDS and not debug_shown:
-                        has_float = "floatShares" in info
-                        print(f"  [DEBUG] 'floatShares' present in .info for "
-                              f"{cand['symbol']}: {has_float} "
-                              f"(value: {info.get('floatShares')!r})")
-                        debug_shown = True
-                    float_shares = info.get("floatShares")
-                    if float_shares is None or float_shares <= MAX_FLOAT_SHARES:
-                        float_filtered.append(cand)
-                except Exception:
-                    float_filtered.append(cand)
-                time.sleep(0.1)  
-            qualified_symbols = float_filtered + qualified_symbols[60:]
+        harvest_pool = sorted(harvest_pool, key=lambda x: x["activity_score"], reverse=True)
+        candidate_pool = harvest_pool[:100]
+        sym_list = [t["symbol"] for t in candidate_pool]
+        if not sym_list:
+            return []
 
-        top_40 = qualified_symbols[:40]
-        
-        sym_list = [t["symbol"] for t in top_40]
-        if sym_list:
-            hist_data = yf.download(sym_list, period="2mo", progress=False)
-            closes = hist_data['Close'] if 'Close' in hist_data else hist_data
-            highs = hist_data['High'] if 'High' in hist_data else None
-            lows = hist_data['Low'] if 'Low' in hist_data else None
-            volumes = hist_data['Volume'] if 'Volume' in hist_data else None
-                
-            for target in top_40:
-                sym = target["symbol"]
-                target["ma_5"] = 0.0 
-                target["adr_pct"] = 0.0
-                target["alignment_state"] = "MIXED"
-                target["vwap_20d"] = 0.0
-                target["daily_rsi"] = 50.0
-                target["trend_7d"] = "Neutral"
-                target["green_red_7d"] = "0G / 0R"
-                target["ret_7d_pct"] = 0.0
-                
-                try:
-                    if isinstance(closes, pd.DataFrame) and sym in closes.columns:
+        print(f"Downloading 4-month historical metrics for {len(sym_list)} shortlisted candidates...")
+        hist_data = yf.download(sym_list, period="4mo", progress=False)
+        closes = hist_data['Close'] if 'Close' in hist_data else hist_data
+        opens = hist_data['Open'] if 'Open' in hist_data else None
+        highs = hist_data['High'] if 'High' in hist_data else None
+        lows = hist_data['Low'] if 'Low' in hist_data else None
+        volumes = hist_data['Volume'] if 'Volume' in hist_data else None
+
+        today_et = datetime.now(ZoneInfo("America/New_York")).date()
+
+        # Helper: Drops today's forming candle once with timezone-aware parsing
+        def drop_today(s):
+            if s is None or not len(s):
+                return s
+            d = pd.to_datetime(s.index[-1])
+            if getattr(d, "tzinfo", None) is not None:
+                d_date = d.tz_convert("America/New_York").date()
+            else:
+                d_date = d.date()
+            return s.iloc[:-1] if d_date == today_et else s
+
+        fully_scored_candidates = []
+        for target in candidate_pool:
+            sym = target["symbol"]
+            target["ma_5"] = 0.0 
+            target["adr_pct"] = 0.0
+            target["alignment_state"] = "MIXED"
+            target["vwap_20d"] = 0.0
+            target["daily_rsi"] = 50.0
+            target["trend_7d"] = "Neutral"
+            target["green_red_7d"] = "0G / 0R"
+            target["ret_7d_pct"] = 0.0
+            target["prev_day_trend"] = "UNKNOWN"
+            target["prev_day_color"] = "UNKNOWN"
+            target["prev_day_return_pct"] = 0.0
+            target["prev_day_candle"] = "UNKNOWN"
+            
+            try:
+                stock_closes, stock_opens, s_highs, s_lows, s_vols = None, None, None, None, None
+
+                # Hardened MultiIndex vs Single-Stock Series Extraction
+                if isinstance(closes, pd.DataFrame):
+                    if sym in closes.columns:
                         stock_closes = closes[sym].dropna()
-                    else:
+                elif isinstance(closes, pd.Series):
+                    if getattr(closes, "name", None) == sym or len(candidate_pool) == 1:
                         stock_closes = closes.dropna()
-                    
-                    if len(stock_closes) >= 21:
-                        ma_5 = stock_closes.tail(5).mean()
-                        ma_10 = stock_closes.tail(10).mean()
-                        ma_21 = stock_closes.tail(21).mean()
-                        ma_50 = target.get("fifty_day_avg", 0)
-                        ema_8 = stock_closes.ewm(span=8, adjust=False).mean().iloc[-1]
-                        
-                        target["ma_5"] = float(ma_5)
 
-                        # 1. Average Daily Range (ADR %) & 20-Day Institutional VWAP
-                        if highs is not None and lows is not None:
-                            if isinstance(highs, pd.DataFrame) and sym in highs.columns:
-                                s_highs = highs[sym].dropna()
-                                s_lows = lows[sym].dropna()
-                            else:
-                                s_highs = highs.dropna()
-                                s_lows = lows.dropna()
-                                
-                            daily_ranges = ((s_highs.tail(21) - s_lows.tail(21)) / s_lows.tail(21)) * 100
-                            target["adr_pct"] = float(daily_ranges.mean())
+                if stock_closes is None or len(stock_closes) < 50:
+                    continue
 
-                            # 20D Institutional VWAP
-                            if volumes is not None:
-                                if isinstance(volumes, pd.DataFrame) and sym in volumes.columns:
-                                    s_vols = volumes[sym].dropna()
-                                else:
-                                    s_vols = volumes.dropna()
-                                common_idx = stock_closes.tail(20).index.intersection(s_highs.index).intersection(s_lows.index).intersection(s_vols.index)
-                                if len(common_idx) >= 5:
-                                    typ_p = (s_highs.loc[common_idx] + s_lows.loc[common_idx] + stock_closes.loc[common_idx]) / 3.0
-                                    v_sum = s_vols.loc[common_idx].sum()
-                                    if v_sum > 0:
-                                        target["vwap_20d"] = float((typ_p * s_vols.loc[common_idx]).sum() / v_sum)
+                if opens is not None:
+                    if isinstance(opens, pd.DataFrame) and sym in opens.columns:
+                        stock_opens = opens[sym].reindex(stock_closes.index).ffill()
+                    elif isinstance(opens, pd.Series) and (getattr(opens, "name", None) == sym or len(candidate_pool) == 1):
+                        stock_opens = opens.reindex(stock_closes.index).ffill()
 
-                        # 2. Wilder's Daily RSI (14)
-                        delta = stock_closes.diff()
-                        avg_gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-                        avg_loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-                        last_gain = float(avg_gain.iloc[-1])
-                        last_loss = float(avg_loss.iloc[-1])
-                        if last_loss == 0:
-                            target["daily_rsi"] = 100.0 if last_gain > 0 else 50.0
-                        else:
-                            rs = last_gain / last_loss
-                            target["daily_rsi"] = float(100.0 - (100.0 / (1.0 + rs)))
+                if highs is not None:
+                    if isinstance(highs, pd.DataFrame) and sym in highs.columns:
+                        s_highs = highs[sym].reindex(stock_closes.index).ffill()
+                    elif isinstance(highs, pd.Series) and (getattr(highs, "name", None) == sym or len(candidate_pool) == 1):
+                        s_highs = highs.reindex(stock_closes.index).ffill()
 
-                        # 3. 7-Day Trend Consistency & Green/Red Day Count
-                        lookback = min(8, len(stock_closes))
-                        rets = stock_closes.tail(lookback).pct_change().dropna()
-                        green = int((rets > 0).sum())
-                        red = int((rets < 0).sum())
-                        p_prior = float(stock_closes.iloc[-lookback])
-                        last_c = float(stock_closes.iloc[-1])
-                        ret_7d = ((last_c - p_prior) / p_prior * 100.0) if p_prior > 0 else 0.0
+                if lows is not None:
+                    if isinstance(lows, pd.DataFrame) and sym in lows.columns:
+                        s_lows = lows[sym].reindex(stock_closes.index).ffill()
+                    elif isinstance(lows, pd.Series) and (getattr(lows, "name", None) == sym or len(candidate_pool) == 1):
+                        s_lows = lows.reindex(stock_closes.index).ffill()
 
-                        target["green_red_7d"] = f"{green}G / {red}R"
-                        target["ret_7d_pct"] = round(ret_7d, 2)
-                        if ret_7d > 1.5 and last_c > ema_8 and green >= 4:
-                            target["trend_7d"] = "Bullish"
-                        elif ret_7d < -1.5 and last_c < ema_8 and red >= 4:
-                            target["trend_7d"] = "Bearish"
-                        else:
-                            target["trend_7d"] = "Neutral"
-                        
-                        # 4. Daily Moving Average Stack Alignment
-                        if ma_50 > 0:
-                            if ma_10 > ma_21 and ma_21 > ma_50:
-                                target["alignment_state"] = "FULL_BULLISH"
-                            elif ma_10 < ma_21 and ma_21 < ma_50:
-                                target["alignment_state"] = "BEARISH"
-                            else:
-                                min_ma, max_ma = min(ma_10, ma_21, ma_50), max(ma_10, ma_21, ma_50)
-                                if ((max_ma - min_ma) / min_ma) <= 0.02:
-                                    target["alignment_state"] = "COMPRESSION"
-                except Exception:
-                    pass
+                if volumes is not None:
+                    if isinstance(volumes, pd.DataFrame) and sym in volumes.columns:
+                        s_vols = volumes[sym].reindex(stock_closes.index).fillna(0)
+                    elif isinstance(volumes, pd.Series) and (getattr(volumes, "name", None) == sym or len(candidate_pool) == 1):
+                        s_vols = volumes.reindex(stock_closes.index).fillna(0)
+
+                # Trim forming bar across all series uniformly
+                stock_closes, stock_opens, s_highs, s_lows, s_vols = map(
+                    drop_today, (stock_closes, stock_opens, s_highs, s_lows, s_vols)
+                )
+
+                if stock_closes is None or len(stock_closes) < 50:
+                    continue
+
+                # Moving averages on completed historical bars
+                ma_5 = stock_closes.tail(5).mean()
+                ma_10 = stock_closes.tail(10).mean()
+                ma_21 = stock_closes.tail(21).mean()
+                ma_50 = stock_closes.tail(50).mean()
+                ema_8 = stock_closes.ewm(span=8, adjust=False).mean().iloc[-1]
+                target["ma_5"] = float(ma_5)
+
+                # Previous day metrics: index -1 is always yesterday, -2 is day before yesterday
+                p_day_close = float(stock_closes.iloc[-1])
+                p_day_prior_close = float(stock_closes.iloc[-2])
+                p_day_open = float(stock_opens.iloc[-1]) if stock_opens is not None else p_day_close
+
+                prev_ret = ((p_day_close - p_day_prior_close) / p_day_prior_close * 100.0) if p_day_prior_close > 0 else 0.0
+                prev_color = "GREEN" if prev_ret >= 0 else "RED"
+                candle_color = "BULLISH" if p_day_close >= p_day_open else "BEARISH"
+
+                target["prev_day_return_pct"] = round(prev_ret, 2)
+                target["prev_day_color"] = prev_color
+                target["prev_day_candle"] = candle_color
+                target["prev_day_trend"] = f"{prev_color} ({prev_ret:+.2f}%)"
+
+                # ADR % & 20-Day VWAP
+                if s_highs is not None and s_lows is not None:
+                    daily_ranges = ((s_highs.tail(21) - s_lows.tail(21)) / s_lows.tail(21)) * 100
+                    target["adr_pct"] = float(daily_ranges.mean())
+
+                    if s_vols is not None:
+                        common_idx = stock_closes.tail(20).index
+                        typ_p = (s_highs.loc[common_idx] + s_lows.loc[common_idx] + stock_closes.loc[common_idx]) / 3.0
+                        v_sum = s_vols.loc[common_idx].sum()
+                        if v_sum > 0:
+                            target["vwap_20d"] = float((typ_p * s_vols.loc[common_idx]).sum() / v_sum)
+
+                # Wilder's Daily RSI (14)
+                delta = stock_closes.diff()
+                avg_gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+                avg_loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+                last_gain = float(avg_gain.iloc[-1])
+                last_loss = float(avg_loss.iloc[-1])
+                if last_loss == 0:
+                    target["daily_rsi"] = 100.0 if last_gain > 0 else 50.0
+                else:
+                    rs = last_gain / last_loss
+                    target["daily_rsi"] = float(100.0 - (100.0 / (1.0 + rs)))
+
+                # 7-Day Trend Consistency & G/R Count
+                lookback = min(8, len(stock_closes))
+                rets = stock_closes.tail(lookback).pct_change().dropna()
+                green = int((rets > 0).sum())
+                red = int((rets < 0).sum())
+                p_prior = float(stock_closes.iloc[-lookback])
+                last_c = float(stock_closes.iloc[-1])
+                ret_7d = ((last_c - p_prior) / p_prior * 100.0) if p_prior > 0 else 0.0
+
+                target["green_red_7d"] = f"{green}G / {red}R"
+                target["ret_7d_pct"] = round(ret_7d, 2)
+                if ret_7d > 1.5 and last_c > ema_8 and green >= 4:
+                    target["trend_7d"] = "Bullish"
+                elif ret_7d < -1.5 and last_c < ema_8 and red >= 4:
+                    target["trend_7d"] = "Bearish"
+                else:
+                    target["trend_7d"] = "Neutral"
+                
+                # MA Alignment Stack
+                if ma_50 > 0:
+                    if ma_10 > ma_21 and ma_21 > ma_50:
+                        target["alignment_state"] = "FULL_BULLISH"
+                    elif ma_10 < ma_21 and ma_21 < ma_50:
+                        target["alignment_state"] = "BEARISH"
+                    else:
+                        min_ma, max_ma = min(ma_10, ma_21, ma_50), max(ma_10, ma_21, ma_50)
+                        if ((max_ma - min_ma) / min_ma) <= 0.02:
+                            target["alignment_state"] = "COMPRESSION"
+
+            except Exception as e:
+                print(f"  [WARN] Failed calculating history metrics for {sym}: {e}")
+                continue
+
+            # Alignment Filter: Red/pullback names (< 3.0%) must have FULL_BULLISH or COMPRESSION structure
+            is_recovering_pullback = target["live_change"] < 3.0
+            if is_recovering_pullback and target["alignment_state"] not in ("FULL_BULLISH", "COMPRESSION"):
+                continue
+            elif target["alignment_state"] == "BEARISH":
+                continue
+
+            pre_score, pre_class = score_morning_setup(target)
+            target["morning_setup_score"] = pre_score
+            target["morning_setup_class"] = pre_class
+
+            fully_scored_candidates.append(target)
+
+        # Slice after scoring & filtering
+        fully_scored_candidates = sorted(
+            fully_scored_candidates, 
+            key=lambda x: x["morning_setup_score"], 
+            reverse=True
+        )
+        top_40 = fully_scored_candidates[:MAX_WATCHLIST_SYMBOLS]
+        
+        print(f"Qualified & Scored {len(fully_scored_candidates)} aligned targets. Selected top {len(top_40)} for WebSocket.")
+        if top_40:
+            print(f"  [TOP PICK] {top_40[0]['finnhub_symbol']} | Score: {top_40[0]['morning_setup_score']:.1f} ({top_40[0]['morning_setup_class']}) | "
+                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | RVOL: {top_40[0]['relative_volume']}")
 
         return top_40
+
     except Exception as e:
         print(f"Screener execution error: {e}")
         return []
 
 
 def register_symbol_in_memory(target):
-    sym = target["symbol"].replace('-', '.')
+    sym = target["finnhub_symbol"]
     with data_lock:
         if sym not in market_data:
             seed_price = target.get("regularMarketPrice", 0)
@@ -416,12 +538,17 @@ def register_symbol_in_memory(target):
                 "prev_close": target.get("prev_close", 0),
                 "open_price": target.get("open_price", seed_price),
                 "gap_pct": target.get("gap_pct", 0.0),
+                "prev_day_trend": target.get("prev_day_trend", "UNKNOWN"),
+                "prev_day_color": target.get("prev_day_color", "UNKNOWN"),
+                "prev_day_return_pct": target.get("prev_day_return_pct", 0.0),
+                "prev_day_candle": target.get("prev_day_candle", "UNKNOWN"),
                 "adr_pct": target.get("adr_pct", 0.0),
                 "vwap_20d": target.get("vwap_20d", 0.0),
                 "daily_rsi": target.get("daily_rsi", 50.0),
                 "trend_7d": target.get("trend_7d", "Neutral"),
                 "green_red_7d": target.get("green_red_7d", "0G / 0R"),
                 "ret_7d_pct": target.get("ret_7d_pct", 0.0),
+                "morning_setup_score": target.get("morning_setup_score", 0.0),
                 "current_price": seed_price,
                 "market_cap_tier": target.get("market_cap_tier", "Unknown Cap"),
                 "cumulative_volume": target.get("day_volume", 0),           
@@ -439,6 +566,7 @@ def register_symbol_in_memory(target):
                 "rolling_sell_vol": 0,
                 "last_alert_time": 0,  
                 "dipped_below_vwap": False,  
+                "dipped_below_vwap_time": 0,
                 "last_reclaim_alert_time": 0,  
                 "session_low_price": seed_session_low_price,
                 "session_low_vwap_distance": None,  
@@ -487,17 +615,22 @@ def evaluation_loop():
                     avg_price = metrics["total_dollar_traded"] / cum_vol
                     vwap_distance = ((current_price - avg_price) / avg_price) * 100
                     
-                    # Under-VWAP flag checks
+                    # Under-VWAP flag checks with Stale Expiration
                     if -2.5 <= vwap_distance <= -0.2:
                         metrics["dipped_below_vwap"] = True
-                    if vwap_distance < -3.0:
+                        metrics["dipped_below_vwap_time"] = current_time
+
+                    # Clear if price crashes through floor, extends too far above VWAP, or exceeds 30-min window
+                    if (vwap_distance < -3.0 or 
+                        vwap_distance > 1.5 or 
+                        (current_time - metrics["dipped_below_vwap_time"]) > MAX_DIP_AGE_SECONDS):
                         metrics["dipped_below_vwap"] = False
                     
                     upside_potential = 0.0
                     if avg_price > 0:
                         upside_potential = ((hod_price - avg_price) / avg_price) * 100
 
-                    dynamic_target = min(15.0, max(5.0, p_change * 0.45))
+                    dynamic_target = min(15.0, max(5.0, abs(p_change) * 0.45))
                     nearest_whole_dollar = round(current_price)
                     is_converging = False
                     if current_price > 2.00:
@@ -505,7 +638,6 @@ def evaluation_loop():
                         if cents_away <= 0.05:
                             is_converging = True
 
-                    # Strictly requires an upward price tick to prevent flat consolidation fakes
                     is_bouncing = current_price > price_60s_ago  
                     stop_loss_price = avg_price * 0.975
                     
@@ -536,20 +668,16 @@ def evaluation_loop():
 
                     distance_to_hod_pct = ((hod_price - current_price) / current_price * 100) if current_price > 0 else 0.0
                     distance_to_hod_pct = max(0.0, distance_to_hod_pct)
-                    is_reclaiming_hod = (distance_to_hod_pct <= RECLAIM_HOD_PROXIMITY_PCT)
 
-                    # Cooldown state checks
                     in_cooldown = (current_time - metrics["last_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     pullback_in_cooldown = (current_time - metrics["last_pullback_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     reclaim_in_cooldown = (current_time - metrics["last_reclaim_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     breakout_in_cooldown = (current_time - metrics["last_breakout_alert_time"]) < ALERT_COOLDOWN_SECONDS
 
-                    # Calculate how far we have bounced off the absolute bottom
                     distance_from_low_pct = 0.0
                     if metrics["session_low_price"] > 0:
                         distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100
 
-                    # --- NEW ENRICHED METRICS: CLV %, Intraday Return, 20D VWAP Dist, ADR Feasibility & Hybrid Score ---
                     day_spread = hod_price - metrics["session_low_price"]
                     intraday_clv_pct = 0.0
                     if day_spread > 0:
@@ -561,11 +689,11 @@ def evaluation_loop():
                     vwap_20d = metrics.get("vwap_20d", 0.0)
                     vwap_20d_dist_pct = ((current_price - vwap_20d) / vwap_20d * 100.0) if vwap_20d > 0 else 0.0
 
-                    live_rvol = calculate_relative_volume(cum_vol, metrics.get("avg_vol_3m", 0))
-                    if live_rvol is not None:
-                        metrics["relative_volume"] = live_rvol
-                    else:
-                        live_rvol = metrics.get("relative_volume") or 1.0
+                    # True Fail-Open RVOL Check
+                    raw_rvol = calculate_relative_volume(cum_vol, metrics.get("avg_vol_3m", 0))
+                    rvol_ok = (raw_rvol is None) or (raw_rvol >= 1.2)
+                    live_rvol = raw_rvol if raw_rvol is not None else (metrics.get("relative_volume") or 1.0)
+                    metrics["relative_volume"] = live_rvol
 
                     target_vs_adr_pct, adr_feasibility = evaluate_adr_feasibility(upside_potential, metrics["adr_pct"])
 
@@ -579,12 +707,12 @@ def evaluation_loop():
                         vwap_20d_dist_pct=vwap_20d_dist_pct
                     )
 
-                    print(f"[{sym}] +{p_change:.2f}% | Score: {setup_score:.1f} ({setup_class}) | "
-                          f"Align: {alignment} | 7D: {metrics['trend_7d']} ({metrics['green_red_7d']}) | "
+                    print(f"[{sym}] {p_change:+.2f}% | Score: {setup_score:.1f} ({setup_class}) | "
+                          f"PrevDay: {metrics['prev_day_trend']} | Align: {alignment} | "
+                          f"7D: {metrics['trend_7d']} ({metrics['green_red_7d']}) | "
                           f"Delta: {order_flow_delta_pct:.1f}% | VWAPDist: {vwap_distance:.2f}% | "
                           f"CLV: {intraday_clv_pct:.1f}% | ADR: {metrics['adr_pct']:.2f}% ({adr_feasibility}) | "
-                          f"Up2HOD: {upside_potential:.2f}% | Dist2HOD: {distance_to_hod_pct:.2f}% | "
-                          f"Streak: {metrics['reclaim_streak']}")
+                          f"Up2HOD: {upside_potential:.2f}% | Streak: {metrics['reclaim_streak']}")
 
                     def build_signal_payload(signal_type_str, pb_tier_str, sl_price):
                         return {
@@ -597,6 +725,10 @@ def evaluation_loop():
                             "live_percent_change": round(p_change, 2),
                             "intraday_return_pct": round(intraday_return_pct, 2),
                             "overnight_gap_pct": round(metrics["gap_pct"], 2),
+                            "prev_day_trend": metrics["prev_day_trend"],
+                            "prev_day_color": metrics["prev_day_color"],
+                            "prev_day_return_pct": metrics["prev_day_return_pct"],
+                            "prev_day_candle": metrics["prev_day_candle"],
                             "last_price": current_price,
                             "intraday_vwap": round(avg_price, 2),
                             "upside_to_hod": round(upside_potential, 2),
@@ -630,9 +762,12 @@ def evaluation_loop():
 
                     # ==============================================================
                     # EXECUTION GATE 1: UNDER-VWAP RECLAIM
+                    # Required: Structure must NOT be bearish
+                    # Upper bound widened to 1.0% to prevent missing fast-moving reclaims
                     # ==============================================================
                     if (metrics["dipped_below_vwap"] and
-                        -0.5 <= vwap_distance <= 0.5 and
+                        alignment in ("FULL_BULLISH", "COMPRESSION") and  
+                        -0.5 <= vwap_distance <= 1.0 and
                         is_bouncing and
                         metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
                         order_flow_delta_pct >= RECLAIM_MIN_ORDER_FLOW_DELTA_PCT and
@@ -662,16 +797,22 @@ def evaluation_loop():
 
                     # ==============================================================
                     # EXECUTION GATE 3: DEEP PULLBACK REVERSAL (THE V-BOTTOM CATCH)
+                    # Required: Volume confirmation + structural alignment
                     # ==============================================================
                     elif (pullback_tier is not None and
-                          vwap_distance < 0 and  # Must still be below VWAP (catching the move early)
-                          distance_from_low_pct >= 1.0 and  # Must have bounced at least 1% off the exact bottom to confirm the pivot
+                          alignment in ("FULL_BULLISH", "COMPRESSION") and  
+                          cum_vol >= 100000 and rvol_ok and  # Fixed fail-open liquidity floor
+                          vwap_distance < 0 and 
+                          distance_from_low_pct >= 1.0 and 
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
                           order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
                           not pullback_in_cooldown):
 
                         metrics["last_pullback_alert_time"] = current_time
-                        reversal_stop_loss_price = metrics["session_low_price"] * 0.98
+                        # Safe base low price prevents negative stop losses
+                        base_low = metrics["session_low_price"] if metrics["session_low_price"] > 0 else current_price
+                        reversal_sl_buffer = max(0.04, base_low * 0.02)
+                        reversal_stop_loss_price = base_low - reversal_sl_buffer
                         triggered_symbols.append(
                             build_signal_payload("DEEP_PULLBACK_RECLAIM", pullback_tier["name"], reversal_stop_loss_price)
                         )
@@ -698,7 +839,6 @@ def evaluation_loop():
                 metrics["price_60s_ago"] = current_price
 
         if triggered_symbols:
-            # Sort triggered setups by Setup Score descending so the best setups appear first
             triggered_symbols = sorted(triggered_symbols, key=lambda x: x["setup_score"], reverse=True)
             print(f"\n>>> FIRING N8N WEBHOOK! {len(triggered_symbols)} stocks triggered algorithmic execution! <<<")
             payload = {
@@ -715,17 +855,55 @@ def watchlist_refresher_loop():
         time.sleep(REFRESH_INTERVAL_SECONDS)
         try:
             latest_targets = get_morning_watchlist()
-            new_symbols = []
-            for target in latest_targets:
-                sym = target["symbol"].replace('-', '.')
-                with data_lock:
-                    exists = sym in market_data
-                if not exists:
-                    register_symbol_in_memory(target)
-                    new_symbols.append(sym)
-            if new_symbols and ws_global and ws_global.sock and ws_global.sock.connected:
-                for sym in new_symbols:
-                    ws_global.send(json.dumps({"type": "subscribe", "symbol": sym}))
+            if not latest_targets:
+                continue
+
+            with data_lock:
+                current_time = time.time()
+                current_active_syms = set(market_data.keys())
+                new_targets = [t for t in latest_targets if t["finnhub_symbol"] not in current_active_syms]
+
+                if new_targets:
+                    for t in new_targets:
+                        register_symbol_in_memory(t)
+
+                    # Capacity management: protect active runners and tickers in cooldown from eviction
+                    if len(market_data) > MAX_WATCHLIST_SYMBOLS:
+                        def eviction_priority(s):
+                            m = market_data[s]
+                            in_cool = any([
+                                (current_time - m.get("last_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                                (current_time - m.get("last_reclaim_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                                (current_time - m.get("last_pullback_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                                (current_time - m.get("last_breakout_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                            ])
+                            active_streak = m.get("reclaim_streak", 0) >= 2
+                            # Active stocks receive a priority boost of 1000 so they are never evicted first
+                            priority = m.get("morning_setup_score", 0.0)
+                            if in_cool or active_streak:
+                                priority += 1000.0
+                            return priority
+
+                        sorted_syms = sorted(market_data.keys(), key=eviction_priority, reverse=True)
+                        syms_to_keep = set(sorted_syms[:MAX_WATCHLIST_SYMBOLS])
+                        syms_to_drop = [s for s in market_data.keys() if s not in syms_to_keep]
+
+                        for s in syms_to_drop:
+                            del market_data[s]
+                            try:
+                                if ws_global and getattr(ws_global, "sock", None) and ws_global.sock.connected:
+                                    ws_global.send(json.dumps({"type": "unsubscribe", "symbol": s}))
+                            except Exception:
+                                pass
+
+                    for t in new_targets:
+                        sym = t["finnhub_symbol"]
+                        if sym in market_data:
+                            try:
+                                if ws_global and getattr(ws_global, "sock", None) and ws_global.sock.connected:
+                                    ws_global.send(json.dumps({"type": "subscribe", "symbol": sym}))
+                            except Exception:
+                                pass
         except Exception as e:
             print(f"Mid-day refresh error: {e}")
 
@@ -787,7 +965,10 @@ def on_open(ws):
     with data_lock:
         symbols_to_sub = list(market_data.keys())
     for sym in symbols_to_sub:
-        ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+        try:
+            ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+        except Exception as e:
+            print(f"Failed to subscribe {sym} on open: {e}")
 
 if __name__ == "__main__":
     websocket.enableTrace(False)
@@ -799,12 +980,15 @@ if __name__ == "__main__":
     threading.Thread(target=watchlist_refresher_loop, daemon=True).start()
     
     while True:
-        ws = websocket.WebSocketApp(
-            f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        ws.run_forever(ping_interval=30, ping_timeout=10)
+        try:
+            ws = websocket.WebSocketApp(
+                f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            print(f"WebSocket reconnect loop error: {e}")
         time.sleep(15)
