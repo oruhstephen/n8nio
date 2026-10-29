@@ -39,6 +39,10 @@ MAX_FLOAT_SHARES = 50_000_000
 ENABLE_FLOAT_FILTER = False
 DEBUG_PRINT_QUOTE_FIELDS = False
 
+# Harvest depth configuration (Scales from 500 to 1,000 quotes across 4 pages)
+HARVEST_TARGET_COUNT = 1000
+PAGE_SIZE = 250
+
 # Maximum duration (in seconds) an under-VWAP dip remains valid for a reclaim (30 mins)
 MAX_DIP_AGE_SECONDS = 1800
 
@@ -120,6 +124,10 @@ def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
 
 
 def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
+    """
+    Front-runs psychological integer sell walls.
+    If target_price lands at $X.00 to $X.08 (and above entry), rounds down to $(X-1).97.
+    """
     if target_price <= 2.00:
         return round(target_price, 2)
     whole_dollar = int(target_price)
@@ -143,6 +151,10 @@ def calculate_trade_levels(
     live_rvol: float,
     order_flow_delta_pct: float
 ) -> dict:
+    """
+    Deterministic institutional entry, multi-stage take-profit (TP1 & TP2),
+    stop-loss, estimated gain %, and reward-to-risk ratio calculator.
+    """
     eff_adr = max(adr_pct, atr_pct, 5.0)
     eff_hod = max(hod_price, current_price)
     eff_atr_dollars = max(atr_14, current_price * 0.04)
@@ -174,9 +186,8 @@ def calculate_trade_levels(
 
     elif signal_type == "HOD_IGNITION_BREAKOUT":
         entry = round(max(current_price, eff_hod), 2)
-        sl = round(max(avg_price, entry - (eff_atr_dollars * 0.25)), 2)
-        if sl >= entry:
-            sl = round(entry * 0.975, 2)
+        # Tightened stop loss: caps risk to ATR buffer without blowing out to distant VWAP
+        sl = round(max(entry * 0.972, entry - (eff_atr_dollars * 0.30)), 2)
 
         if (live_rvol or 1.0) >= 2.5 and order_flow_delta_pct >= 35.0:
             expansion_mult = 0.80
@@ -213,6 +224,9 @@ def calculate_trade_levels(
 
 
 def score_morning_setup(target: dict) -> tuple[float, str]:
+    """
+    Dedicated Pre-Market Structural Scoring (0-100 scale).
+    """
     score = 0.0
     score += min(target.get("adr_pct", 0.0), 12.0) * 2.5
     rvol = target.get("relative_volume") or 1.0
@@ -310,10 +324,10 @@ def score_intraday_setup(
 
 
 # ==========================================
-# PHASE 1: SCREENER (HARVEST 500 -> SHORTLIST 100 -> SCORE -> SLICE 40)
+# PHASE 1: SCREENER (HARVEST 1000 -> SHORTLIST 100 -> SCORE ALL -> SLICE 40)
 # ==========================================
 def get_morning_watchlist():
-    print("\n--- SCREENING MARKET: HARVEST 500 -> SHORTLIST 100 -> SCORE ALL -> SLICE 40 ---")
+    print(f"\n--- SCREENING MARKET: HARVEST {HARVEST_TARGET_COUNT} -> SHORTLIST 100 -> SCORE ALL -> SLICE 40 ---")
     try:
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
@@ -325,17 +339,20 @@ def get_morning_watchlist():
         ])
 
         quotes = []
-        for offset in (0, 250):
+        offsets = list(range(0, HARVEST_TARGET_COUNT, PAGE_SIZE))
+
+        for offset in offsets:
             try:
-                resp = yf.screen(q, sortField='dayvolume', sortAsc=False, size=250, offset=offset)
+                resp = yf.screen(q, sortField='dayvolume', sortAsc=False, size=PAGE_SIZE, offset=offset)
                 batch = resp.get('quotes', [])
                 quotes.extend(batch)
-                if len(batch) < 250:
+                if len(batch) < PAGE_SIZE:
                     break
+                time.sleep(0.1)  # 100ms throttle between pages to prevent rate limiting
             except Exception as e:
                 print(f"  [WARN] Screen failed at offset {offset}: {e}")
 
-        print(f"Harvested {len(quotes)} raw quotes across 2 pages.")
+        print(f"Harvested {len(quotes)} raw quotes across {len(offsets)} pages.")
 
         harvest_pool = []
         rel_vol_unavailable_count = 0
@@ -600,7 +617,7 @@ def get_morning_watchlist():
         print(f"Qualified & Scored {len(fully_scored_candidates)} aligned targets. Selected top {len(top_40)} for WebSocket.")
         if top_40:
             print(f"  [TOP PICK] {top_40[0]['finnhub_symbol']} | Score: {top_40[0]['morning_setup_score']:.1f} ({top_40[0]['morning_setup_class']}) | "
-                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | ATR: ${top_40[0]['atr_14']:.2f} ({top_40[0]['atr_pct']:.2f}%) | RVOL: {top_40[0]['relative_volume']}")
+                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | ATR: ${top_40[0]['atr_14']:.2f} ({top_40[0]['atr_pct']:.1f}%) | RVOL: {top_40[0]['relative_volume']}")
 
         return top_40
 
@@ -714,7 +731,8 @@ def evaluation_loop():
                     if avg_price > 0:
                         upside_potential = ((hod_price - avg_price) / avg_price) * 100
 
-                    dynamic_target = min(18.0, max(5.0, abs(p_change) * 0.45, metrics["adr_pct"] * 0.45))
+                    # Calibrated dynamic target: normalized to prevent blocking high R:R setups
+                    dynamic_target = min(15.0, max(5.0, abs(p_change) * 0.40))
                     nearest_whole_dollar = round(current_price)
                     is_converging = False
                     if current_price > 2.00:
@@ -860,11 +878,12 @@ def evaluation_loop():
 
                     # ==============================================================
                     # EXECUTION GATE 1: UNDER-VWAP RECLAIM
+                    # Evaluates distance from current entry to HOD to guarantee true R:R
                     # ==============================================================
                     if (metrics["dipped_below_vwap"] and
                         alignment in ("FULL_BULLISH", "COMPRESSION") and  
                         -0.5 <= vwap_distance <= 1.0 and
-                        upside_potential >= max(3.5, metrics["adr_pct"] * 0.35) and
+                        distance_to_hod_pct >= max(3.5, metrics["adr_pct"] * 0.35) and
                         has_adr_fuel and
                         is_bouncing and
                         metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
@@ -958,6 +977,7 @@ def evaluation_loop():
 
                 metrics["price_60s_ago"] = current_price
 
+        # Print all lines sorted by setup_score descending
         if log_entries:
             log_entries.sort(key=lambda x: x[0], reverse=True)
             for _, line in log_entries:
@@ -992,6 +1012,7 @@ def watchlist_refresher_loop():
                     for t in new_targets:
                         register_symbol_in_memory(t)
 
+                    # Capacity management: protect active runners and tickers in cooldown from eviction
                     if len(market_data) > MAX_WATCHLIST_SYMBOLS:
                         def eviction_priority(s):
                             m = market_data[s]
