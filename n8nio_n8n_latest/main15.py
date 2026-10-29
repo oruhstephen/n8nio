@@ -40,7 +40,7 @@ ENABLE_FLOAT_FILTER = False
 DEBUG_PRINT_QUOTE_FIELDS = False
 
 # Harvest depth configuration (Scales from 500 to 1,000 quotes across 4 pages)
-HARVEST_TARGET_COUNT = 1000
+HARVEST_TARGET_COUNT = 1250
 PAGE_SIZE = 250
 
 # Maximum duration (in seconds) an under-VWAP dip remains valid for a reclaim (30 mins)
