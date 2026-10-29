@@ -120,10 +120,6 @@ def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
 
 
 def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
-    """
-    Front-runs psychological integer sell walls.
-    If target_price lands at $X.00 to $X.08 (and above entry), rounds down to $(X-1).97.
-    """
     if target_price <= 2.00:
         return round(target_price, 2)
     whole_dollar = int(target_price)
@@ -142,37 +138,33 @@ def calculate_trade_levels(
     hod_price: float,
     session_low_price: float,
     adr_pct: float,
+    atr_14: float,
+    atr_pct: float,
     live_rvol: float,
     order_flow_delta_pct: float
 ) -> dict:
-    """
-    Deterministic institutional entry, multi-stage take-profit (TP1 & TP2),
-    stop-loss, estimated gain %, and reward-to-risk ratio calculator.
-    """
-    eff_adr = max(adr_pct, 5.0)
+    eff_adr = max(adr_pct, atr_pct, 5.0)
     eff_hod = max(hod_price, current_price)
+    eff_atr_dollars = max(atr_14, current_price * 0.04)
 
     if signal_type == "VWAP_CONTINUATION_BOUNCE":
-        # Buy the VWAP support zone (don't chase extended ticks)
         entry = round(min(current_price, avg_price * 1.004), 2)
-        sl = round(min(avg_price * 0.975, entry * 0.978), 2)
+        sl = round(min(avg_price * 0.975, entry - (eff_atr_dollars * 0.25)), 2)
         raw_tp2 = max(eff_hod, entry * (1.0 + (eff_adr * 0.45) / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
         tp1 = adjust_for_whole_dollar(entry + 0.55 * (tp2 - entry), entry)
 
     elif signal_type == "VWAP_RECLAIM_CROSSOVER":
-        # Buy the crossover confirmation
         entry = round(min(current_price, avg_price * 1.006), 2)
-        sl = round(min(avg_price * 0.978, entry * 0.975), 2)
+        sl = round(min(avg_price * 0.978, entry - (eff_atr_dollars * 0.25)), 2)
         raw_tp2 = max(eff_hod, entry * (1.0 + (eff_adr * 0.45) / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
         tp1 = adjust_for_whole_dollar(entry + 0.50 * (tp2 - entry), entry)
 
     elif signal_type == "DEEP_PULLBACK_RECLAIM":
-        # V-Bottom Entry: TP1 is Intraday VWAP (mean reversion), TP2 is HOD (trend resumption)
         entry = round(current_price, 2)
         base_low = session_low_price if (0 < session_low_price <= current_price) else current_price * 0.985
-        sl_buffer = max(0.04, base_low * 0.015)
+        sl_buffer = max(0.04, eff_atr_dollars * 0.15)
         sl = round(min(base_low - sl_buffer, entry * 0.98), 2)
 
         raw_tp1 = max(avg_price, entry * 1.03)
@@ -181,16 +173,15 @@ def calculate_trade_levels(
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
 
     elif signal_type == "HOD_IGNITION_BREAKOUT":
-        # Breakout Trigger at HOD: Project ADR expansion above HOD scaled by RVOL & Delta
         entry = round(max(current_price, eff_hod), 2)
-        sl = round(max(avg_price, entry * 0.975), 2)
+        sl = round(max(avg_price, entry - (eff_atr_dollars * 0.25)), 2)
         if sl >= entry:
             sl = round(entry * 0.975, 2)
 
         if (live_rvol or 1.0) >= 2.5 and order_flow_delta_pct >= 35.0:
-            expansion_mult = 0.80  # High-velocity institutional range expansion
+            expansion_mult = 0.80
         else:
-            expansion_mult = 0.50  # Standard breakout expansion
+            expansion_mult = 0.50
 
         expansion_pct = max(4.0, eff_adr * expansion_mult)
         raw_tp2 = entry * (1.0 + expansion_pct / 100.0)
@@ -222,9 +213,6 @@ def calculate_trade_levels(
 
 
 def score_morning_setup(target: dict) -> tuple[float, str]:
-    """
-    Dedicated Pre-Market Structural Scoring (0-100 scale).
-    """
     score = 0.0
     score += min(target.get("adr_pct", 0.0), 12.0) * 2.5
     rvol = target.get("relative_volume") or 1.0
@@ -445,6 +433,8 @@ def get_morning_watchlist():
             sym = target["symbol"]
             target["ma_5"] = 0.0 
             target["adr_pct"] = 0.0
+            target["atr_14"] = 0.0
+            target["atr_pct"] = 0.0
             target["alignment_state"] = "MIXED"
             target["vwap_20d"] = 0.0
             target["daily_rsi"] = 50.0
@@ -521,8 +511,23 @@ def get_morning_watchlist():
                 target["prev_day_trend"] = f"{prev_color} ({prev_ret:+.2f}%)"
 
                 if s_highs is not None and s_lows is not None:
+                    # 1. 21-day ADR %
                     daily_ranges = ((s_highs.tail(21) - s_lows.tail(21)) / s_lows.tail(21)) * 100
                     target["adr_pct"] = float(daily_ranges.mean())
+
+                    # 2. Wilder's 14-day Daily ATR
+                    prev_close_shift = stock_closes.shift(1)
+                    tr1 = s_highs - s_lows
+                    tr2 = (s_highs - prev_close_shift).abs()
+                    tr3 = (s_lows - prev_close_shift).abs()
+                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+                    atr_series = true_range.ewm(alpha=1/14, adjust=False).mean()
+                    atr_val = float(atr_series.iloc[-1])
+                    last_close_val = float(stock_closes.iloc[-1])
+
+                    target["atr_14"] = round(atr_val, 2)
+                    target["atr_pct"] = round((atr_val / last_close_val * 100.0), 2) if last_close_val > 0 else 0.0
 
                     if s_vols is not None:
                         common_idx = stock_closes.tail(20).index
@@ -595,7 +600,7 @@ def get_morning_watchlist():
         print(f"Qualified & Scored {len(fully_scored_candidates)} aligned targets. Selected top {len(top_40)} for WebSocket.")
         if top_40:
             print(f"  [TOP PICK] {top_40[0]['finnhub_symbol']} | Score: {top_40[0]['morning_setup_score']:.1f} ({top_40[0]['morning_setup_class']}) | "
-                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | RVOL: {top_40[0]['relative_volume']}")
+                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | ATR: ${top_40[0]['atr_14']:.2f} ({top_40[0]['atr_pct']:.2f}%) | RVOL: {top_40[0]['relative_volume']}")
 
         return top_40
 
@@ -621,6 +626,8 @@ def register_symbol_in_memory(target):
                 "prev_day_return_pct": target.get("prev_day_return_pct", 0.0),
                 "prev_day_candle": target.get("prev_day_candle", "UNKNOWN"),
                 "adr_pct": target.get("adr_pct", 0.0),
+                "atr_14": target.get("atr_14", 0.0),
+                "atr_pct": target.get("atr_pct", 0.0),
                 "vwap_20d": target.get("vwap_20d", 0.0),
                 "daily_rsi": target.get("daily_rsi", 50.0),
                 "trend_7d": target.get("trend_7d", "Neutral"),
@@ -694,7 +701,6 @@ def evaluation_loop():
                     avg_price = metrics["total_dollar_traded"] / cum_vol
                     vwap_distance = ((current_price - avg_price) / avg_price) * 100
                     
-                    # Under-VWAP flag checks with Stale Expiration
                     if -2.5 <= vwap_distance <= -0.2:
                         metrics["dipped_below_vwap"] = True
                         metrics["dipped_below_vwap_time"] = current_time
@@ -708,7 +714,6 @@ def evaluation_loop():
                     if avg_price > 0:
                         upside_potential = ((hod_price - avg_price) / avg_price) * 100
 
-                    # Upgraded Dynamic Target: Scales with both p_change and ADR %
                     dynamic_target = min(18.0, max(5.0, abs(p_change) * 0.45, metrics["adr_pct"] * 0.45))
                     nearest_whole_dollar = round(current_price)
                     is_converging = False
@@ -767,13 +772,11 @@ def evaluation_loop():
                     vwap_20d = metrics.get("vwap_20d", 0.0)
                     vwap_20d_dist_pct = ((current_price - vwap_20d) / vwap_20d * 100.0) if vwap_20d > 0 else 0.0
 
-                    # True Fail-Open RVOL Check
                     raw_rvol = calculate_relative_volume(cum_vol, metrics.get("avg_vol_3m", 0))
                     rvol_ok = (raw_rvol is None) or (raw_rvol >= 1.2)
                     live_rvol = raw_rvol if raw_rvol is not None else (metrics.get("relative_volume") or 1.0)
                     metrics["relative_volume"] = live_rvol
 
-                    # Remaining ADR Fuel Check
                     day_range_pct = ((hod_price - metrics["session_low_price"]) / metrics["session_low_price"] * 100.0) if metrics["session_low_price"] > 0 else 0.0
                     adr_exhaustion_ratio = (day_range_pct / metrics["adr_pct"]) if metrics["adr_pct"] > 0 else 1.0
                     has_adr_fuel = (adr_exhaustion_ratio <= 1.35) or (live_rvol >= 3.0)
@@ -795,7 +798,8 @@ def evaluation_loop():
                         f"PrevDay: {metrics['prev_day_trend']:<14} | Align: {alignment:<12} | "
                         f"7D: {metrics['trend_7d']:<7} ({metrics['green_red_7d']:<7}) | "
                         f"Delta: {order_flow_delta_pct:>+5.1f}% | VWAPDist: {vwap_distance:>+5.2f}% | "
-                        f"CLV: {intraday_clv_pct:>+5.1f}% | ADR: {metrics['adr_pct']:>4.2f}% ({adr_feasibility:<18}) | "
+                        f"CLV: {intraday_clv_pct:>+5.1f}% | ADR: {metrics['adr_pct']:>4.2f}% | "
+                        f"ATR: ${metrics['atr_14']:.2f} ({metrics['atr_pct']:.1f}%) | "
                         f"Up2HOD: {upside_potential:>5.2f}% | Streak: {metrics['reclaim_streak']}"
                     )
                     log_entries.append((setup_score, formatted_line))
@@ -847,6 +851,8 @@ def evaluation_loop():
                             "is_over_extended": is_over_extended,
                             "order_flow_delta_1m": round(order_flow_delta_pct, 2),
                             "historical_adr_pct": round(metrics["adr_pct"], 2),
+                            "atr_14": metrics["atr_14"],
+                            "atr_pct": metrics["atr_pct"],
                             "target_vs_adr_pct": target_vs_adr_pct,
                             "adr_feasibility": adr_feasibility,
                             "DateTime": timestamp_str
@@ -868,7 +874,8 @@ def evaluation_loop():
 
                         levels = calculate_trade_levels(
                             "VWAP_RECLAIM_CROSSOVER", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], live_rvol, order_flow_delta_pct
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct
                         )
                         if levels["reward_risk_ratio"] >= MIN_REWARD_RISK_RATIO:
                             metrics["last_reclaim_alert_time"] = current_time
@@ -891,7 +898,8 @@ def evaluation_loop():
                         
                         levels = calculate_trade_levels(
                             "VWAP_CONTINUATION_BOUNCE", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], live_rvol, order_flow_delta_pct
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct
                         )
                         if levels["reward_risk_ratio"] >= MIN_REWARD_RISK_RATIO:
                             metrics["last_alert_time"] = current_time  
@@ -914,7 +922,8 @@ def evaluation_loop():
 
                         levels = calculate_trade_levels(
                             "DEEP_PULLBACK_RECLAIM", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], live_rvol, order_flow_delta_pct
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct
                         )
                         if levels["reward_risk_ratio"] >= MIN_REWARD_RISK_RATIO:
                             metrics["last_pullback_alert_time"] = current_time
@@ -938,7 +947,8 @@ def evaluation_loop():
 
                         levels = calculate_trade_levels(
                             "HOD_IGNITION_BREAKOUT", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], live_rvol, order_flow_delta_pct
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct
                         )
                         if levels["reward_risk_ratio"] >= MIN_REWARD_RISK_RATIO:
                             metrics["last_breakout_alert_time"] = current_time
@@ -948,7 +958,6 @@ def evaluation_loop():
 
                 metrics["price_60s_ago"] = current_price
 
-        # Print all lines sorted by setup_score descending
         if log_entries:
             log_entries.sort(key=lambda x: x[0], reverse=True)
             for _, line in log_entries:
