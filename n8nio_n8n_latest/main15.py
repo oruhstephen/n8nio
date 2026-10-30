@@ -33,7 +33,7 @@ MAX_TICK_MOVE_PCT = 20.0
 # Screener parameters
 MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
 MIN_RELATIVE_VOLUME = 1.2                   # Permissive floor to allow recovering pullbacks
-MIN_CHANGE_PCT = -10.0                      # Captures deep pullbacks and recovering dip setups
+MIN_CHANGE_PCT = -20.0                      # Captures deep pullbacks and recovering dip setups
 MAX_WATCHLIST_SYMBOLS = 40                  # Sliced to 40 for Finnhub WebSocket cap & sub-ms loop latency
 MAX_FLOAT_SHARES = 50_000_000
 ENABLE_FLOAT_FILTER = False
