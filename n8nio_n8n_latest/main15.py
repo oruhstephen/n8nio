@@ -57,7 +57,7 @@ DEEP_PULLBACK_TIERS = [
 ]
 
 RECLAIM_HOD_PROXIMITY_PCT = 3.0
-RECLAIM_MIN_STREAK = 2
+RECLAIM_MIN_STREAK = 3
 RECLAIM_MIN_ORDER_FLOW_DELTA_PCT = 20.0
 
 # Re-entrant Lock prevents self-deadlock when the refresher calls register_symbol_in_memory
