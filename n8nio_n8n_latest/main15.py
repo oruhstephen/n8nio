@@ -51,9 +51,9 @@ MIN_REWARD_RISK_RATIO = 1.5
 
 # --- DEEP PULLBACK / HOD-RECLAIM SIGNAL ---
 DEEP_PULLBACK_TIERS = [
-    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 3.1,  "min_order_flow_delta_pct": 15.0},
-    {"name": "TIER_2_MODERATE", "min_depth_pct": 7.0,  "min_order_flow_delta_pct": 25.0},
-    {"name": "TIER_3_DEEP",     "min_depth_pct": 10.0, "min_order_flow_delta_pct": 35.0},
+    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 3.1,  "min_order_flow_delta_pct": 20.0},
+    {"name": "TIER_2_MODERATE", "min_depth_pct": 7.0,  "min_order_flow_delta_pct": 30.0},
+    {"name": "TIER_3_DEEP",     "min_depth_pct": 10.0, "min_order_flow_delta_pct": 40.0},
 ]
 
 RECLAIM_HOD_PROXIMITY_PCT = 3.0
