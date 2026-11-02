@@ -28,7 +28,7 @@ ALERT_COOLDOWN_SECONDS = 900
 REFRESH_INTERVAL_SECONDS = 1800
 
 # Reject any single trade print that implies an unrealistic jump from the previous tick
-MAX_TICK_MOVE_PCT = 30.0
+MAX_TICK_MOVE_PCT = 20.0
 
 # Screener parameters
 MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
@@ -51,13 +51,13 @@ MIN_REWARD_RISK_RATIO = 1.5
 
 # --- DEEP PULLBACK / HOD-RECLAIM SIGNAL ---
 DEEP_PULLBACK_TIERS = [
-    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 3.1,  "min_order_flow_delta_pct": 20.0},
-    {"name": "TIER_2_MODERATE", "min_depth_pct": 7.0,  "min_order_flow_delta_pct": 30.0},
-    {"name": "TIER_3_DEEP",     "min_depth_pct": 10.0, "min_order_flow_delta_pct": 40.0},
+    {"name": "TIER_1_SHALLOW",  "min_depth_pct": 3.1,  "min_order_flow_delta_pct": 15.0},
+    {"name": "TIER_2_MODERATE", "min_depth_pct": 7.0,  "min_order_flow_delta_pct": 25.0},
+    {"name": "TIER_3_DEEP",     "min_depth_pct": 10.0, "min_order_flow_delta_pct": 35.0},
 ]
 
 RECLAIM_HOD_PROXIMITY_PCT = 3.0
-RECLAIM_MIN_STREAK = 3
+RECLAIM_MIN_STREAK = 2
 RECLAIM_MIN_ORDER_FLOW_DELTA_PCT = 20.0
 
 # Re-entrant Lock prevents self-deadlock when the refresher calls register_symbol_in_memory
