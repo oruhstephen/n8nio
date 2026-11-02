@@ -67,6 +67,25 @@ ws_global = None
 
 
 # ==========================================
+# 1.A: THREAD-SAFE WEBSOCKET DISPATCHER
+# ==========================================
+def send_ws_message(payload: dict) -> bool:
+    """
+    Safely sends JSON over the active WebSocket, guarding against NoneType and stale sockets.
+    """
+    global ws_global
+    try:
+        if ws_global is not None:
+            sock = getattr(ws_global, "sock", None)
+            if sock is not None and getattr(sock, "connected", False):
+                ws_global.send(json.dumps(payload))
+                return True
+    except Exception as e:
+        print(f"  [WS WARN] Failed to send {payload}: {e}")
+    return False
+
+
+# ==========================================
 # HELPER FUNCTIONS: TIERING, RVOL, SCORING & TRADE MATH
 # ==========================================
 def get_mcap_tier(mcap: float) -> str:
@@ -125,17 +144,30 @@ def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
 
 def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
     """
-    Front-runs psychological integer sell walls.
-    If target_price lands at $X.00 to $X.08 (and above entry), rounds down to $(X-1).97.
+    1.D Fix: Front-runs psychological whole-dollar and half-dollar resistance walls.
+    Eliminates float rounding noise.
+    - Stocks > $2.00: $X.00 to $X.08 -> $(X-1).97
+    - Stocks $1.00 to $5.00: $X.50 to $X.54 -> $(X).47
     """
-    if target_price <= 2.00:
+    if target_price <= 1.00:
         return round(target_price, 2)
+
     whole_dollar = int(target_price)
-    cents = target_price - whole_dollar
+    cents = round(target_price - whole_dollar, 2)
+
+    # Whole dollar barrier: $X.00 - $X.08
     if 0.0 <= cents <= 0.08 and whole_dollar > entry_price:
         adjusted = whole_dollar - 0.03
         if adjusted > entry_price * 1.01:
             return round(adjusted, 2)
+
+    # Half-dollar barrier for low-priced equities ($1.00 to $5.00): $X.50 - $X.54
+    if 1.00 <= target_price <= 5.00:
+        if 0.50 <= cents <= 0.54 and (whole_dollar + 0.50) > entry_price:
+            adjusted = whole_dollar + 0.47
+            if adjusted > entry_price * 1.01:
+                return round(adjusted, 2)
+
     return round(target_price, 2)
 
 
@@ -152,12 +184,10 @@ def calculate_trade_levels(
     order_flow_delta_pct: float
 ) -> dict | None:
     """
-    State After Refactor (8.5+/10) Implementation:
     Deterministic institutional execution engine featuring empirical volatility,
     slippage-adjusted entries, structural stop-loss bounds, and realistic headroom-capped targets.
     Returns None if entry has runaway or volatility data is invalid.
     """
-    # 1. Pure Empirical Volatility (No artificial 4% or 5% floors)
     eff_adr = max(adr_pct, atr_pct)
     if eff_adr <= 0.0 or current_price <= 0.0:
         return None
@@ -169,31 +199,25 @@ def calculate_trade_levels(
     max_realistic_reach = current_price * (1.0 + (eff_adr / 100.0) * 0.75)
 
     if signal_type == "VWAP_CONTINUATION_BOUNCE":
-        # Disallow chasing if market has run past the entry zone
         if current_price > avg_price * 1.004:
             return None
         entry = round(current_price, 2)
 
-        # Stop bounded between -1.5% and -2.8% below VWAP using real ATR
         atr_stop = entry - (eff_atr_dollars * 0.22)
         sl = round(max(avg_price * 0.972, min(avg_price * 0.985, atr_stop)), 2)
 
-        # TP2 capped at whichever is closer: true HOD or remaining statistical ADR headroom
         raw_tp2 = min(eff_hod, max_realistic_reach)
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
         tp1 = round(entry + 0.55 * (tp2 - entry), 2)
 
     elif signal_type == "VWAP_RECLAIM_CROSSOVER":
-        # Disallow chasing if market has run past the crossover zone
         if current_price > avg_price * 1.006:
             return None
         entry = round(current_price, 2)
 
-        # Stop bounded between -1.5% and -2.8% below VWAP
         atr_stop = entry - (eff_atr_dollars * 0.22)
         sl = round(max(avg_price * 0.972, min(avg_price * 0.985, atr_stop)), 2)
 
-        # TP2 capped at true HOD or statistical ADR reach
         raw_tp2 = min(eff_hod, max_realistic_reach)
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
@@ -201,28 +225,23 @@ def calculate_trade_levels(
     elif signal_type == "DEEP_PULLBACK_RECLAIM":
         entry = round(current_price, 2)
 
-        # Structural low stop with dynamic ATR buffer, risk-capped at -3.5%
         base_low = session_low_price if (0.0 < session_low_price <= current_price) else current_price * 0.985
         structural_low_stop = base_low - max(0.04, eff_atr_dollars * 0.15)
         sl = round(max(structural_low_stop, entry * 0.965), 2)
-        sl = min(sl, round(entry * 0.985, 2))  # Guarantees minimum 1.5% breathing room
+        sl = min(sl, round(entry * 0.985, 2))
 
-        # TP2 is HOD (capped by realistic reach); TP1 is Intraday VWAP (capped at 65% of TP2 move)
         raw_tp2 = min(eff_hod, max_realistic_reach)
         tp2 = adjust_for_whole_dollar(max(raw_tp2, avg_price * 1.02), entry)
         raw_tp1 = min(max(avg_price, entry * 1.025), entry + 0.65 * (tp2 - entry))
         tp1 = adjust_for_whole_dollar(raw_tp1, entry)
 
     elif signal_type == "HOD_IGNITION_BREAKOUT":
-        # Entry adjusted for realistic execution slippage (+15 bps above breakout point)
         trigger_price = max(current_price, eff_hod)
-        entry = round(trigger_price * 1.0015, 2)
+        entry = round(trigger_price * 1.0015, 2)  # 15 bps execution slippage model
 
-        # Breakout stop bounded between -1.5% and -2.8% below entry
         atr_stop = entry - (eff_atr_dollars * 0.25)
         sl = round(max(entry * 0.972, min(entry * 0.985, atr_stop)), 2)
 
-        # Empirical volume-scaled expansion (no artificial 0.80x target inflation)
         expansion_mult = 0.40 if ((live_rvol or 1.0) >= 2.5 and order_flow_delta_pct >= 35.0) else 0.25
         expansion_pct = max(2.5, eff_adr * expansion_mult)
 
@@ -255,9 +274,6 @@ def calculate_trade_levels(
 
 
 def score_morning_setup(target: dict) -> tuple[float, str]:
-    """
-    Dedicated Pre-Market Structural Scoring (0-100 scale).
-    """
     score = 0.0
     score += min(target.get("adr_pct", 0.0), 12.0) * 2.5
     rvol = target.get("relative_volume") or 1.0
@@ -547,11 +563,18 @@ def get_morning_watchlist():
 
                 p_day_close = float(stock_closes.iloc[-1])
                 p_day_prior_close = float(stock_closes.iloc[-2])
-                p_day_open = float(stock_opens.iloc[-1]) if stock_opens is not None else p_day_close
+                
+                # 1.C Fix: Robust prior-day open extraction & candle logic
+                has_valid_open = stock_opens is not None and len(stock_opens) > 0 and not pd.isna(stock_opens.iloc[-1])
+                p_day_open = float(stock_opens.iloc[-1]) if has_valid_open else p_day_prior_close
 
                 prev_ret = ((p_day_close - p_day_prior_close) / p_day_prior_close * 100.0) if p_day_prior_close > 0 else 0.0
                 prev_color = "GREEN" if prev_ret >= 0 else "RED"
-                candle_color = "BULLISH" if p_day_close >= p_day_open else "BEARISH"
+
+                if has_valid_open:
+                    candle_color = "BULLISH" if p_day_close > p_day_open else ("BEARISH" if p_day_close < p_day_open else ("BULLISH" if prev_ret >= 0 else "BEARISH"))
+                else:
+                    candle_color = "BULLISH" if prev_ret >= 0 else "BEARISH"
 
                 target["prev_day_return_pct"] = round(prev_ret, 2)
                 target["prev_day_color"] = prev_color
@@ -697,6 +720,8 @@ def register_symbol_in_memory(target):
                 "prev_tick_price": seed_price,
                 "rolling_buy_vol": 0,
                 "rolling_sell_vol": 0,
+                "reject_count": 0,
+                "near_hod_streak": 0,  # 2.C Fix: Tracks 60-second cycles coiling near HOD
                 "last_alert_time": 0,  
                 "dipped_below_vwap": False,  
                 "dipped_below_vwap_time": 0,
@@ -799,6 +824,12 @@ def evaluation_loop():
 
                     distance_to_hod_pct = ((hod_price - current_price) / current_price * 100) if current_price > 0 else 0.0
                     distance_to_hod_pct = max(0.0, distance_to_hod_pct)
+
+                    # 2.C Fix: Consolidation tracking near HOD (within 2.0%)
+                    if distance_to_hod_pct <= 2.0:
+                        metrics["near_hod_streak"] += 1
+                    else:
+                        metrics["near_hod_streak"] = 0
 
                     in_cooldown = (current_time - metrics["last_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     pullback_in_cooldown = (current_time - metrics["last_pullback_alert_time"]) < ALERT_COOLDOWN_SECONDS
@@ -908,11 +939,12 @@ def evaluation_loop():
 
                     # ==============================================================
                     # EXECUTION GATE 1: UNDER-VWAP RECLAIM
+                    # 2.A Fix: Raised minimum runway directly from entry to HOD
                     # ==============================================================
                     if (metrics["dipped_below_vwap"] and
                         alignment in ("FULL_BULLISH", "COMPRESSION") and  
                         -0.5 <= vwap_distance <= 1.0 and
-                        distance_to_hod_pct >= max(3.5, metrics["adr_pct"] * 0.35) and
+                        distance_to_hod_pct >= max(4.0, metrics["adr_pct"] * 0.40) and  # 2.A: True runway check
                         has_adr_fuel and
                         is_bouncing and
                         metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
@@ -981,10 +1013,13 @@ def evaluation_loop():
 
                     # ==============================================================
                     # EXECUTION GATE 4: HIGH-OF-DAY (HOD) IGNITION BREAKOUT
+                    # 2.C Fix: Enforces CLV >= 65% and consolidation base >= 2 cycles
                     # ==============================================================
                     elif (p_change >= 6.0 and
                           1.0 < vwap_distance <= 8.0 and
                           distance_to_hod_pct <= 1.5 and
+                          metrics["near_hod_streak"] >= 2 and     # 2.C: Base formed (no vertical spikes)
+                          intraday_clv_pct >= 65.0 and            # 2.C: Holding top 35% of daily range
                           (live_rvol >= 1.8 or has_adr_fuel) and
                           is_bouncing and
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
@@ -1063,20 +1098,14 @@ def watchlist_refresher_loop():
 
                         for s in syms_to_drop:
                             del market_data[s]
-                            try:
-                                if ws_global and getattr(ws_global, "sock", None) and ws_global.sock.connected:
-                                    ws_global.send(json.dumps({"type": "unsubscribe", "symbol": s}))
-                            except Exception:
-                                pass
+                            # 1.A: Thread-safe WebSocket unsubscription
+                            send_ws_message({"type": "unsubscribe", "symbol": s})
 
                     for t in new_targets:
                         sym = t["finnhub_symbol"]
                         if sym in market_data:
-                            try:
-                                if ws_global and getattr(ws_global, "sock", None) and ws_global.sock.connected:
-                                    ws_global.send(json.dumps({"type": "subscribe", "symbol": sym}))
-                            except Exception:
-                                pass
+                            # 1.A: Thread-safe WebSocket subscription
+                            send_ws_message({"type": "subscribe", "symbol": sym})
         except Exception as e:
             print(f"Mid-day refresh error: {e}")
 
@@ -1097,30 +1126,45 @@ def on_message(ws, message):
 
                 with data_lock:
                     if sym in market_data:
-                        prev_tick = market_data[sym]["prev_tick_price"]
+                        m = market_data[sym]
+                        prev_tick = m["prev_tick_price"]
+                        is_rebase = False
+
                         if prev_tick > 0:
-                            tick_move_pct = abs(price - prev_tick) / prev_tick * 100
+                            tick_move_pct = abs(price - prev_tick) / prev_tick * 100.0
+
+                            # Dynamic bad-print / volatility guard with 3-strike rebase
                             if tick_move_pct > MAX_TICK_MOVE_PCT:
-                                print(f"  [ANOMALY] {sym} rejected tick ${price:.2f} "
-                                      f"({tick_move_pct:.1f}% vs prev ${prev_tick:.2f}) - skipped")
-                                continue
+                                m["reject_count"] = m.get("reject_count", 0) + 1
+                                if m["reject_count"] < 3:
+                                    continue  # Treat as transient bad tick
+                                
+                                # 3 consecutive prints confirm genuine displacement (e.g. halt resumption)
+                                print(f"  [REBASE] {sym} accepting ${price:.2f} ({tick_move_pct:+.1f}%) after 3 consecutive rejects")
+                                is_rebase = True
 
-                        market_data[sym]["current_price"] = price
-                        market_data[sym]["cumulative_volume"] += vol
-                        market_data[sym]["total_dollar_traded"] += (price * vol)
-                        if price > market_data[sym]["high_of_day_price"]:
-                            market_data[sym]["high_of_day_price"] = price
+                        # Reset reject counter on valid print or confirmed rebase
+                        m["reject_count"] = 0
 
-                        if prev_tick > 0:
+                        # Update state
+                        m["current_price"] = price
+                        m["cumulative_volume"] += vol
+                        m["total_dollar_traded"] += (price * vol)
+
+                        if price > m["high_of_day_price"]:
+                            m["high_of_day_price"] = price
+
+                        # Do not attribute artificial 100% directional volume to a rebase jump
+                        if prev_tick > 0 and not is_rebase:
                             if price > prev_tick:
-                                market_data[sym]["rolling_buy_vol"] += vol  
+                                m["rolling_buy_vol"] += vol  
                             elif price < prev_tick:
-                                market_data[sym]["rolling_sell_vol"] += vol 
-                        
-                        market_data[sym]["prev_tick_price"] = price
-                        prev_close = market_data[sym]["prev_close"]
+                                m["rolling_sell_vol"] += vol 
+
+                        m["prev_tick_price"] = price
+                        prev_close = m["prev_close"]
                         if prev_close > 0:
-                            market_data[sym]["percent_change"] = ((price - prev_close) / prev_close) * 100
+                            m["percent_change"] = ((price - prev_close) / prev_close) * 100.0
     except json.JSONDecodeError:
         pass
     except Exception as e:
@@ -1130,18 +1174,19 @@ def on_error(ws, error):
     print(f"WebSocket Error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
+    global ws_global
+    ws_global = None
     print("### WebSocket Connection Closed ###")
 
 def on_open(ws):
     global ws_global
     ws_global = ws
+    print("### WebSocket Connection Established ###")
     with data_lock:
         symbols_to_sub = list(market_data.keys())
     for sym in symbols_to_sub:
-        try:
-            ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
-        except Exception as e:
-            print(f"Failed to subscribe {sym} on open: {e}")
+        # 1.A: Resubscribe all active symbols safely
+        send_ws_message({"type": "subscribe", "symbol": sym})
 
 if __name__ == "__main__":
     websocket.enableTrace(False)
