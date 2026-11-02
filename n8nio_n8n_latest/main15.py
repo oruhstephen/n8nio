@@ -28,7 +28,7 @@ ALERT_COOLDOWN_SECONDS = 900
 REFRESH_INTERVAL_SECONDS = 1800
 
 # Reject any single trade print that implies an unrealistic jump from the previous tick
-MAX_TICK_MOVE_PCT = 20.0
+MAX_TICK_MOVE_PCT = 30.0
 
 # Screener parameters
 MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
