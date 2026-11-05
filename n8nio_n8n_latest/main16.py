@@ -1,16 +1,17 @@
 import os
+import websocket
 import json
+import requests
 import time
 import threading
+import sys
 import warnings
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
-import requests
-import websocket
 import yfinance as yf
 from yfinance import EquityQuery
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Silence internal yfinance / pandas deprecation warnings
 warnings.filterwarnings('ignore')
@@ -18,8 +19,11 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ==========================================
-FINNHUB_TOKEN = "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g"
-N8N_WEBHOOK_URL = "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
+FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "d86fpu1r01qgiu458c80d86fpu1r01qgiu458c8g")
+N8N_WEBHOOK_URL = os.getenv(
+    "N8N_WEBHOOK_URL",
+    "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
+)
 
 # Prevent alert spamming: 15-minute (900 seconds) cooldown per ticker
 ALERT_COOLDOWN_SECONDS = 900
@@ -32,19 +36,24 @@ MAX_TICK_MOVE_PCT = 20.0
 
 # Screener parameters
 MARKET_CAP_CEILING = 2_000_000_000_000_000  # $2QD Ceiling
-MIN_RELATIVE_VOLUME = 1.2
-MIN_CHANGE_PCT = -20.0
-MAX_WATCHLIST_SYMBOLS = 40
+MIN_RELATIVE_VOLUME = 1.2                    # Permissive floor to allow recovering pullbacks
+MIN_CHANGE_PCT = -20.0                       # Captures deep pullbacks and recovering dip setups
+MAX_WATCHLIST_SYMBOLS = 40                   # Sliced to 40 for Finnhub WebSocket cap & sub-ms loop latency
+MAX_FLOAT_SHARES = 50_000_000
+ENABLE_FLOAT_FILTER = False
+DEBUG_PRINT_QUOTE_FIELDS = False
+
+# Harvest depth configuration across 5 pages
 HARVEST_TARGET_COUNT = 1250
 PAGE_SIZE = 250
 
 # Target Calibration Parameters (+6% Target Engine)
 MIN_TARGET_GAIN_PCT = 6.0          # Hard floor for Take Profit 2
-MIN_ADR_PCT = 1.0                  # Baseline statistical daily range required to qualify
+MIN_ADR_PCT = 7.0                  # Baseline statistical daily range required to qualify
 MAX_STOP_LOSS_PCT = 3.8            # Maximum allowable risk; rejects trade if structural stop exceeds this
 MIN_1M_ORDER_FLOW_VOLUME = 500     # Minimum volume in 60s window to calculate valid order flow delta
 
-# Episodic Pivot Override Parameters (e.g. Day-1 catalysts like YOU at +25% with low peacetime ADR)
+# Episodic Pivot Override Parameters (Day-1 catalysts like YOU at +25% with low peacetime ADR)
 EPISODIC_PIVOT_GAIN = 6.0          # Minimum gain % to qualify for catalyst ADR bypass
 EPISODIC_PIVOT_RVOL = 2.5          # Minimum RVOL to confirm institutional catalyst expansion
 
@@ -61,6 +70,7 @@ DEEP_PULLBACK_TIERS = [
     {"name": "TIER_3_DEEP",      "min_depth_pct": 10.0, "min_order_flow_delta_pct": 35.0},
 ]
 
+RECLAIM_HOD_PROXIMITY_PCT = 3.0
 RECLAIM_MIN_STREAK = 2
 RECLAIM_MIN_ORDER_FLOW_DELTA_PCT = 20.0
 
@@ -72,11 +82,11 @@ ws_global = None
 
 
 # ==========================================
-# THREAD-SAFE WEBSOCKET DISPATCHER
+# 1.A: THREAD-SAFE WEBSOCKET DISPATCHER
 # ==========================================
 def send_ws_message(payload: dict) -> bool:
     """
-    Safely sends JSON over the active WebSocket, guarding against concurrent socket writes.
+    Safely sends JSON over the active WebSocket, guarding against concurrent writes and stale sockets.
     """
     global ws_global
     with ws_send_lock:
@@ -92,7 +102,7 @@ def send_ws_message(payload: dict) -> bool:
 
 
 # ==========================================
-# HELPER FUNCTIONS: QUANTITATIVE & TRADE MATH
+# HELPER FUNCTIONS: TIERING, RVOL, SCORING & TRADE MATH
 # ==========================================
 def get_mcap_tier(mcap: float) -> str:
     if not mcap or mcap <= 0:
@@ -108,7 +118,7 @@ def get_mcap_tier(mcap: float) -> str:
     return "Micro Cap (<$300M)"
 
 
-def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | None:
+def calculate_relative_volume(day_volume, avg_vol_3m):
     if not avg_vol_3m or avg_vol_3m <= 0 or not day_volume or day_volume <= 0:
         return None
 
@@ -124,7 +134,7 @@ def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | N
     else:
         elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
 
-    # Non-linear quadratic approximation for intraday volume curve
+    # Quadratic approximation of institutional U-curve volume progression
     t = elapsed_minutes / session_minutes
     expected_fraction = (0.35 * t) + (0.65 * (t ** 2.2))
     expected_fraction = max(0.01, min(1.0, expected_fraction))
@@ -133,7 +143,7 @@ def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | N
     return round(day_volume / expected_volume, 2) if expected_volume > 0 else None
 
 
-def evaluate_adr_feasibility(upside_potential: float, adr_pct: float) -> tuple[float, str]:
+def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
     if not adr_pct or adr_pct <= 0:
         return 0.0, "Unknown ADR"
 
@@ -151,19 +161,25 @@ def evaluate_adr_feasibility(upside_potential: float, adr_pct: float) -> tuple[f
 
 
 def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
+    """
+    Front-runs psychological whole-dollar and half-dollar resistance walls.
+    Eliminates float rounding noise.
+    - Stocks > $2.00:$X.00 to $X.08 ->$(X-1).97
+    - Stocks $1.00 to $5.00:$X.50 to $X.54 ->$(X).47
+    """
     if target_price <= 1.00:
         return round(target_price, 2)
 
     whole_dollar = int(target_price)
     cents = round(target_price - whole_dollar, 2)
 
-    # Front-run whole dollar barrier: $X.00 - $X.08
+    # Whole dollar barrier: $X.00 -$X.08
     if 0.0 <= cents <= 0.08 and whole_dollar > entry_price:
         adjusted = whole_dollar - 0.03
         if adjusted > entry_price * 1.01:
             return round(adjusted, 2)
 
-    # Front-run half-dollar barrier for low-priced equities ($1.00 - $5.00)
+    # Half-dollar barrier for low-priced equities ($1.00 to $5.00): $X.50 -$X.54
     if 1.00 <= target_price <= 5.00:
         if 0.50 <= cents <= 0.54 and (whole_dollar + 0.50) > entry_price:
             adjusted = whole_dollar + 0.47
@@ -188,11 +204,10 @@ def calculate_trade_levels(
     vol_progress_pct: float = 100.0
 ) -> dict | None:
     """
-    Deterministic institutional execution engine enforcing +6% target feasibility,
+    Deterministic institutional execution engine featuring empirical volatility,
     catalyst volatility expansion, dynamic volume fuel factor scaling,
     structural stop-loss integrity, and wall penetration logic.
     """
-    # Realized intraday expansion for episodic catalysts
     day_range_pct = ((hod_price - session_low_price) / session_low_price * 100.0) if session_low_price > 0 else 0.0
     is_active_catalyst = (live_rvol >= EPISODIC_PIVOT_RVOL or vol_progress_pct >= 150.0)
 
@@ -204,18 +219,18 @@ def calculate_trade_levels(
     eff_hod = max(hod_price, current_price)
     eff_atr_dollars = atr_14 if atr_14 > 0.0 else (current_price * (eff_adr / 100.0))
 
-    # 1. Compute Volume Fuel Factor (square-root dampener clamped to [0.55, 1.65])
+    # Compute Volume Fuel Factor (square-root dampener clamped to [0.55, 1.65])
     vol_fuel_factor = max(0.55, min(1.65, float(np.sqrt(max(0.01, remaining_vol_ratio)))))
 
-    # 2. Volume Exhaustion Protection: clamp expansion if excessive turnover occurs with weak delta
+    # Volume Exhaustion Protection: clamp expansion if excessive turnover occurs with weak delta
     is_exhaustion_churn = (vol_progress_pct >= 350.0 and order_flow_delta_pct < 20.0)
     if is_exhaustion_churn:
         vol_fuel_factor = min(vol_fuel_factor, 0.75)
 
-    # 3. Dynamic Headroom Ceiling scaled by Volume Fuel Factor
+    # Dynamic Headroom Ceiling scaled by Volume Fuel Factor
     max_realistic_reach = current_price * (1.0 + (eff_adr / 100.0) * (0.85 * vol_fuel_factor))
 
-    # Finding 3: Reconciled with Gate 2 (-0.5% to +0.4% from VWAP)
+    # Gate 2 Alignment Check (-0.5% to +0.4% from VWAP)
     if signal_type == "VWAP_CONTINUATION_BOUNCE":
         if current_price > avg_price * 1.004:
             return None
@@ -228,9 +243,9 @@ def calculate_trade_levels(
             raw_tp2 = entry + ((raw_tp2 - entry) * 0.70)
 
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        tp1 = round(entry + 0.50 * (tp2 - entry), 2)
+        tp1 = round(entry + 0.55 * (tp2 - entry), 2)
 
-    # Finding 3: Reconciled with Gate 1 (-0.5% to +0.6% from VWAP)
+    # Gate 1 Alignment Check (-0.5% to +0.6% from VWAP)
     elif signal_type == "VWAP_RECLAIM_CROSSOVER":
         if current_price > avg_price * 1.006:
             return None
@@ -243,7 +258,7 @@ def calculate_trade_levels(
             raw_tp2 = max(raw_tp2, eff_hod * (1.0 + (eff_adr / 100.0) * 0.15))
 
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        # Finding 6: If front-running whole dollar cuts gain below 6% on high-fuel reclaim, punch through
+        # Whole-dollar punch-through on high-fuel reclaim if wall drops gain below threshold
         if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
             tp2 = round(int(raw_tp2) + 0.20, 2)
 
@@ -257,13 +272,13 @@ def calculate_trade_levels(
         sl = min(sl, round(entry * 0.985, 2))
 
         raw_tp2 = min(eff_hod, max_realistic_reach)
-        tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        raw_tp1 = min(max(avg_price, entry * 1.03), entry + 0.50 * (tp2 - entry))
+        tp2 = adjust_for_whole_dollar(max(raw_tp2, avg_price * 1.02), entry)
+        raw_tp1 = min(max(avg_price, entry * 1.025), entry + 0.65 * (tp2 - entry))
         tp1 = adjust_for_whole_dollar(raw_tp1, entry)
 
     elif signal_type == "HOD_IGNITION_BREAKOUT":
         trigger_price = max(current_price, eff_hod)
-        entry = round(trigger_price * 1.0015, 2)
+        entry = round(trigger_price * 1.0015, 2)  # 15 bps execution slippage model
         atr_stop = entry - (eff_atr_dollars * 0.25)
         sl = round(max(entry * 0.972, min(entry * 0.985, atr_stop)), 2)
 
@@ -271,12 +286,11 @@ def calculate_trade_levels(
         raw_tp2 = entry * (1.0 + (expansion_pct / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
 
-        # Finding 6: If front-running whole dollar cuts gain below 6% on high volume fuel, punch through
-        est_gain_check = ((tp2 - entry) / entry) * 100.0
-        if est_gain_check < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
+        # Whole-dollar punch-through on high-fuel breakout
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
             tp2 = round(int(raw_tp2) + 0.20, 2)
 
-        tp1 = round(entry + 0.40 * (tp2 - entry), 2)
+        tp1 = round(entry + 0.50 * (tp2 - entry), 2)
 
     elif signal_type == "EOD_OVERNIGHT_IGNITION":
         entry = round(current_price, 2)
@@ -293,9 +307,12 @@ def calculate_trade_levels(
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
 
     else:
-        return None
+        entry = round(current_price, 2)
+        sl = round(current_price * 0.975, 2)
+        tp1 = round(current_price * 1.03, 2)
+        tp2 = round(current_price * 1.06, 2)
 
-    # Finding 4: Enforce structural stop integrity. Reject outright if risk exceeds MAX_STOP_LOSS_PCT
+    # Enforce structural stop integrity: reject outright if risk exceeds MAX_STOP_LOSS_PCT
     min_sl_price = round(entry * (1.0 - (MAX_STOP_LOSS_PCT / 100.0)), 2)
     if sl < min_sl_price:
         return None
@@ -303,8 +320,8 @@ def calculate_trade_levels(
     if sl >= entry or tp2 <= entry:
         return None
 
-    est_gain_tp2_pct = round(((tp2 - entry) / entry) * 100.0, 2)
-    est_gain_tp1_pct = round(((tp1 - entry) / entry) * 100.0, 2)
+    est_gain_tp2_pct = round(((tp2 - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
+    est_gain_tp1_pct = round(((tp1 - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
     # Strictly reject any setup that cannot deliver >= 6% gain on TP2
     if est_gain_tp2_pct < MIN_TARGET_GAIN_PCT:
@@ -427,18 +444,18 @@ def score_intraday_setup(
 
 
 # ==========================================
-# PHASE 1: SCREENER ENGINE
+# PHASE 1: SCREENER (HARVEST 1250 -> SHORTLIST 100 -> SCORE ALL -> SLICE 40)
 # ==========================================
-def get_morning_watchlist() -> list[dict]:
+def get_morning_watchlist():
     print(f"\n--- SCREENING MARKET: HARVEST {HARVEST_TARGET_COUNT} -> SHORTLIST 100 -> ADR FILTER -> SLICE 40 ---")
     try:
         q = EquityQuery('and', [
             EquityQuery('eq',  ['region', 'us']),
-            EquityQuery('gte', ['intradaymarketcap', 60_000_000]),
-            EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]),
-            EquityQuery('gt',  ['intradayprice', 1.00]),
+            EquityQuery('gte', ['intradaymarketcap', 60_000_000]),      
+            EquityQuery('lt',  ['intradaymarketcap', MARKET_CAP_CEILING]), 
+            EquityQuery('gt',  ['intradayprice', 1.00]),           
             EquityQuery('gte', ['percentchange', MIN_CHANGE_PCT]),
-            EquityQuery('gte', ['avgdailyvol3m', 1_000_000])
+            EquityQuery('gte', ['avgdailyvol3m', 1_000_000])          
         ])
 
         quotes = []
@@ -451,13 +468,15 @@ def get_morning_watchlist() -> list[dict]:
                 quotes.extend(batch)
                 if len(batch) < PAGE_SIZE:
                     break
-                time.sleep(0.1)
+                time.sleep(0.1)  # 100ms throttle between pages to prevent rate limiting
             except Exception as e:
                 print(f"  [WARN] Screen failed at offset {offset}: {e}")
 
         print(f"Harvested {len(quotes)} raw quotes across {len(offsets)} pages.")
 
         harvest_pool = []
+        rel_vol_unavailable_count = 0
+
         for quote in quotes:
             raw_sym = quote.get("symbol")
             if not raw_sym:
@@ -473,25 +492,26 @@ def get_morning_watchlist() -> list[dict]:
             fifty_day_avg = quote.get("fiftyDayAverage", 0)
             avg_vol_3m = quote.get("averageDailyVolume3Month", 0) or quote.get("avgdailyvol3m", 0)
 
-            # Finding 7: Graceful fallback between marketCap and intradaymarketcap
+            # Fallback between marketCap and intradaymarketcap
             raw_market_cap = quote.get("marketCap", 0) or quote.get("intradaymarketcap", 0)
             cap_tier = get_mcap_tier(raw_market_cap)
 
-            gap_pct = (
-                ((open_price - prev_close) / prev_close * 100.0)
-                if (prev_close > 0 and open_price > 0) else 0.0
-            )
+            gap_pct = ((open_price - prev_close) / prev_close * 100.0) if (prev_close and prev_close > 0 and open_price and open_price > 0) else 0.0
+
             relative_volume = calculate_relative_volume(day_volume, avg_vol_3m)
 
             if relative_volume is not None and relative_volume < MIN_RELATIVE_VOLUME:
                 continue
+            elif relative_volume is None:
+                rel_vol_unavailable_count += 1
 
             macro_uptrend = (current_price > fifty_day_avg and fifty_day_avg > 0)
             typical_price = current_price
             if (day_high + day_low + current_price) > 0:
                 typical_price = (day_high + day_low + current_price) / 3.0
-
+                
             seed_dollar_traded = typical_price * day_volume
+
             range_span = day_high - day_low
             intraday_location = ((current_price - day_low) / range_span) if range_span > 0 else 0.5
             rvol_mult = relative_volume if relative_volume is not None else 1.0
@@ -508,7 +528,7 @@ def get_morning_watchlist() -> list[dict]:
                 "day_low": day_low,
                 "day_volume": day_volume,
                 "avg_vol_3m": avg_vol_3m,
-                "market_cap_tier": cap_tier,
+                "market_cap_tier": cap_tier, 
                 "seed_dollar_traded": seed_dollar_traded,
                 "fifty_day_avg": fifty_day_avg,
                 "macro_uptrend": macro_uptrend,
@@ -517,13 +537,16 @@ def get_morning_watchlist() -> list[dict]:
                 "activity_score": activity_score
             })
 
-        harvest_pool.sort(key=lambda x: x["activity_score"], reverse=True)
+        if rel_vol_unavailable_count:
+            print(f"  [WARN] RVOL data unavailable for {rel_vol_unavailable_count} candidate(s); allowed through as fail-open.")
+
+        harvest_pool = sorted(harvest_pool, key=lambda x: x["activity_score"], reverse=True)
         candidate_pool = harvest_pool[:100]
         sym_list = [t["symbol"] for t in candidate_pool]
         if not sym_list:
             return []
 
-        print(f"Downloading historical bars for {len(sym_list)} shortlisted candidates...")
+        print(f"Downloading 4-month historical metrics for {len(sym_list)} shortlisted candidates...")
         hist_data = yf.download(sym_list, period="4mo", progress=False, group_by='column')
 
         def extract_series(data_frame, col_name, ticker):
@@ -539,26 +562,33 @@ def get_morning_watchlist() -> list[dict]:
         today_et = datetime.now(ZoneInfo("America/New_York")).date()
 
         def drop_today(s):
-            if s is None or s.empty:
+            if s is None or not len(s):
                 return s
-            last_dt = pd.to_datetime(s.index[-1])
-            if getattr(last_dt, "tzinfo", None) is not None:
-                d_date = last_dt.tz_convert("America/New_York").date()
+            d = pd.to_datetime(s.index[-1])
+            if getattr(d, "tzinfo", None) is not None:
+                d_date = d.tz_convert("America/New_York").date()
             else:
-                d_date = last_dt.date()
+                d_date = d.date()
             return s.iloc[:-1] if d_date == today_et else s
 
         fully_scored_candidates = []
         for target in candidate_pool:
             sym = target["symbol"]
-            target.update({
-                "ma_5": 0.0, "adr_pct": 0.0, "atr_14": 0.0, "atr_pct": 0.0,
-                "alignment_state": "MIXED", "vwap_20d": 0.0, "daily_rsi": 50.0,
-                "trend_7d": "Neutral", "green_red_7d": "0G / 0R", "ret_7d_pct": 0.0,
-                "prev_day_trend": "UNKNOWN", "prev_day_color": "UNKNOWN",
-                "prev_day_return_pct": 0.0, "prev_day_candle": "UNKNOWN"
-            })
-
+            target["ma_5"] = 0.0 
+            target["adr_pct"] = 0.0
+            target["atr_14"] = 0.0
+            target["atr_pct"] = 0.0
+            target["alignment_state"] = "MIXED"
+            target["vwap_20d"] = 0.0
+            target["daily_rsi"] = 50.0
+            target["trend_7d"] = "Neutral"
+            target["green_red_7d"] = "0G / 0R"
+            target["ret_7d_pct"] = 0.0
+            target["prev_day_trend"] = "UNKNOWN"
+            target["prev_day_color"] = "UNKNOWN"
+            target["prev_day_return_pct"] = 0.0
+            target["prev_day_candle"] = "UNKNOWN"
+            
             try:
                 stock_closes = drop_today(extract_series(hist_data, 'Close', sym))
                 stock_opens = drop_today(extract_series(hist_data, 'Open', sym))
@@ -569,21 +599,26 @@ def get_morning_watchlist() -> list[dict]:
                 if stock_closes is None or len(stock_closes) < 50:
                     continue
 
-                ma_5 = float(stock_closes.tail(5).mean())
-                ma_10 = float(stock_closes.tail(10).mean())
-                ma_21 = float(stock_closes.tail(21).mean())
-                ma_50 = float(stock_closes.tail(50).mean())
-                ema_8 = float(stock_closes.ewm(span=8, adjust=False).mean().iloc[-1])
-                target["ma_5"] = ma_5
+                ma_5 = stock_closes.tail(5).mean()
+                ma_10 = stock_closes.tail(10).mean()
+                ma_21 = stock_closes.tail(21).mean()
+                ma_50 = stock_closes.tail(50).mean()
+                ema_8 = stock_closes.ewm(span=8, adjust=False).mean().iloc[-1]
+                target["ma_5"] = float(ma_5)
 
                 p_day_close = float(stock_closes.iloc[-1])
                 p_day_prior_close = float(stock_closes.iloc[-2])
-                has_valid_open = stock_opens is not None and not stock_opens.empty and not pd.isna(stock_opens.iloc[-1])
+                
+                has_valid_open = stock_opens is not None and len(stock_opens) > 0 and not pd.isna(stock_opens.iloc[-1])
                 p_day_open = float(stock_opens.iloc[-1]) if has_valid_open else p_day_prior_close
 
                 prev_ret = ((p_day_close - p_day_prior_close) / p_day_prior_close * 100.0) if p_day_prior_close > 0 else 0.0
                 prev_color = "GREEN" if prev_ret >= 0 else "RED"
-                candle_color = "BULLISH" if p_day_close >= p_day_open else "BEARISH"
+
+                if has_valid_open:
+                    candle_color = "BULLISH" if p_day_close > p_day_open else ("BEARISH" if p_day_close < p_day_open else ("BULLISH" if prev_ret >= 0 else "BEARISH"))
+                else:
+                    candle_color = "BULLISH" if prev_ret >= 0 else "BEARISH"
 
                 target["prev_day_return_pct"] = round(prev_ret, 2)
                 target["prev_day_color"] = prev_color
@@ -591,27 +626,28 @@ def get_morning_watchlist() -> list[dict]:
                 target["prev_day_trend"] = f"{prev_color} ({prev_ret:+.2f}%)"
 
                 if s_highs is not None and s_lows is not None:
-                    daily_ranges = ((s_highs.tail(21) - s_lows.tail(21)) / s_lows.tail(21)) * 100.0
+                    daily_ranges = ((s_highs.tail(21) - s_lows.tail(21)) / s_lows.tail(21)) * 100
                     target["adr_pct"] = float(daily_ranges.mean())
 
                     prev_close_shift = stock_closes.shift(1)
-                    tr = pd.concat([
-                        s_highs - s_lows,
-                        (s_highs - prev_close_shift).abs(),
-                        (s_lows - prev_close_shift).abs()
-                    ], axis=1).max(axis=1)
+                    tr1 = s_highs - s_lows
+                    tr2 = (s_highs - prev_close_shift).abs()
+                    tr3 = (s_lows - prev_close_shift).abs()
+                    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-                    atr_series = tr.ewm(alpha=1 / 14, adjust=False).mean()
+                    atr_series = true_range.ewm(alpha=1/14, adjust=False).mean()
                     atr_val = float(atr_series.iloc[-1])
+                    last_close_val = float(stock_closes.iloc[-1])
+
                     target["atr_14"] = round(atr_val, 2)
-                    target["atr_pct"] = round((atr_val / p_day_close * 100.0), 2) if p_day_close > 0 else 0.0
+                    target["atr_pct"] = round((atr_val / last_close_val * 100.0), 2) if last_close_val > 0 else 0.0
 
                     if s_vols is not None:
-                        c_idx = stock_closes.tail(20).index
-                        typ_p = (s_highs.loc[c_idx] + s_lows.loc[c_idx] + stock_closes.loc[c_idx]) / 3.0
-                        vol_sum = s_vols.loc[c_idx].sum()
-                        if vol_sum > 0:
-                            target["vwap_20d"] = float((typ_p * s_vols.loc[c_idx]).sum() / vol_sum)
+                        common_idx = stock_closes.tail(20).index
+                        typ_p = (s_highs.loc[common_idx] + s_lows.loc[common_idx] + stock_closes.loc[common_idx]) / 3.0
+                        v_sum = s_vols.loc[common_idx].sum()
+                        if v_sum > 0:
+                            target["vwap_20d"] = float((typ_p * s_vols.loc[common_idx]).sum() / v_sum)
 
                 # Episodic Pivot Override: allow low peacetime ADR if volume/momentum confirms catalyst expansion
                 is_episodic_pivot = (
@@ -624,28 +660,35 @@ def get_morning_watchlist() -> list[dict]:
                 delta = stock_closes.diff()
                 avg_gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
                 avg_loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-                last_g = float(avg_gain.iloc[-1])
-                last_l = float(avg_loss.iloc[-1])
-                target["daily_rsi"] = 100.0 if last_l == 0 else float(100.0 - (100.0 / (1.0 + (last_g / last_l))))
+                last_gain = float(avg_gain.iloc[-1])
+                last_loss = float(avg_loss.iloc[-1])
+                if last_loss == 0:
+                    target["daily_rsi"] = 100.0 if last_gain > 0 else 50.0
+                else:
+                    rs = last_gain / last_loss
+                    target["daily_rsi"] = float(100.0 - (100.0 / (1.0 + rs)))
 
                 lookback = min(8, len(stock_closes))
                 rets = stock_closes.tail(lookback).pct_change().dropna()
-                green_bars = int((rets > 0).sum())
-                red_bars = int((rets < 0).sum())
+                green = int((rets > 0).sum())
+                red = int((rets < 0).sum())
                 p_prior = float(stock_closes.iloc[-lookback])
-                ret_7d = ((p_day_close - p_prior) / p_prior * 100.0) if p_prior > 0 else 0.0
+                last_c = float(stock_closes.iloc[-1])
+                ret_7d = ((last_c - p_prior) / p_prior * 100.0) if p_prior > 0 else 0.0
 
-                target["green_red_7d"] = f"{green_bars}G / {red_bars}R"
+                target["green_red_7d"] = f"{green}G / {red}R"
                 target["ret_7d_pct"] = round(ret_7d, 2)
-                if ret_7d > 1.5 and p_day_close > ema_8 and green_bars >= 4:
+                if ret_7d > 1.5 and last_c > ema_8 and green >= 4:
                     target["trend_7d"] = "Bullish"
-                elif ret_7d < -1.5 and p_day_close < ema_8 and red_bars >= 4:
+                elif ret_7d < -1.5 and last_c < ema_8 and red >= 4:
                     target["trend_7d"] = "Bearish"
-
+                else:
+                    target["trend_7d"] = "Neutral"
+                
                 if ma_50 > 0:
-                    if ma_10 > ma_21 > ma_50:
+                    if ma_10 > ma_21 and ma_21 > ma_50:
                         target["alignment_state"] = "FULL_BULLISH"
-                    elif ma_10 < ma_21 < ma_50:
+                    elif ma_10 < ma_21 and ma_21 < ma_50:
                         target["alignment_state"] = "BEARISH"
                     else:
                         min_ma, max_ma = min(ma_10, ma_21, ma_50), max(ma_10, ma_21, ma_50)
@@ -656,19 +699,30 @@ def get_morning_watchlist() -> list[dict]:
                 print(f"  [WARN] Failed calculating history metrics for {sym}: {e}")
                 continue
 
-            if target["live_change"] < 3.0 and target["alignment_state"] not in ("FULL_BULLISH", "COMPRESSION"):
+            is_recovering_pullback = target["live_change"] < 3.0
+            if is_recovering_pullback and target["alignment_state"] not in ("FULL_BULLISH", "COMPRESSION"):
                 continue
-            if target["alignment_state"] == "BEARISH":
+            elif target["alignment_state"] == "BEARISH":
                 continue
 
             pre_score, pre_class = score_morning_setup(target)
             target["morning_setup_score"] = pre_score
             target["morning_setup_class"] = pre_class
+
             fully_scored_candidates.append(target)
 
-        fully_scored_candidates.sort(key=lambda x: x["morning_setup_score"], reverse=True)
+        fully_scored_candidates = sorted(
+            fully_scored_candidates, 
+            key=lambda x: x["morning_setup_score"], 
+            reverse=True
+        )
         top_40 = fully_scored_candidates[:MAX_WATCHLIST_SYMBOLS]
-        print(f"Qualified & Scored {len(fully_scored_candidates)} targets (ADR >= {MIN_ADR_PCT}% or Catalyst). Monitored set: {len(top_40)}")
+        
+        print(f"Qualified & Scored {len(fully_scored_candidates)} aligned targets (ADR >= {MIN_ADR_PCT}% or Catalyst). Selected top {len(top_40)} for WebSocket.")
+        if top_40:
+            print(f"  [TOP PICK] {top_40[0]['finnhub_symbol']} | Score: {top_40[0]['morning_setup_score']:.1f} ({top_40[0]['morning_setup_class']}) | "
+                  f"PrevDay: {top_40[0]['prev_day_trend']} | Align: {top_40[0]['alignment_state']} | ADR: {top_40[0]['adr_pct']:.2f}% | ATR: ${top_40[0]['atr_14']:.2f} ({top_40[0]['atr_pct']:.1f}%) | RVOL: {top_40[0]['relative_volume']}")
+
         return top_40
 
     except Exception as e:
@@ -676,13 +730,13 @@ def get_morning_watchlist() -> list[dict]:
         return []
 
 
-def register_symbol_in_memory(target: dict):
+def register_symbol_in_memory(target):
     sym = target["finnhub_symbol"]
     with data_lock:
         if sym not in market_data:
             seed_price = target.get("regularMarketPrice", 0)
             day_low = target.get("day_low", 0)
-            seed_low = day_low if (0 < day_low <= seed_price) else seed_price
+            seed_session_low_price = day_low if (day_low and day_low > 0 and day_low <= seed_price) else seed_price
 
             market_data[sym] = {
                 "prev_close": target.get("prev_close", 0),
@@ -703,28 +757,28 @@ def register_symbol_in_memory(target: dict):
                 "morning_setup_score": target.get("morning_setup_score", 0.0),
                 "current_price": seed_price,
                 "market_cap_tier": target.get("market_cap_tier", "Unknown Cap"),
-                "cumulative_volume": target.get("day_volume", 0),
+                "cumulative_volume": target.get("day_volume", 0),           
                 "avg_vol_3m": target.get("avg_vol_3m", 0),
                 "relative_volume": target.get("relative_volume", 1.0),
-                "total_dollar_traded": target.get("seed_dollar_traded", 0),
+                "total_dollar_traded": target.get("seed_dollar_traded", 0), 
                 "percent_change": target.get("live_change", 0),
-                "high_of_day_price": target.get("day_high", 0),
+                "high_of_day_price": target.get("day_high", 0),             
                 "price_60s_ago": seed_price,
-                "ma_5": target.get("ma_5", 0.0),
+                "ma_5": target.get("ma_5", 0.0), 
                 "alignment_state": target.get("alignment_state", "MIXED"),
                 "macro_uptrend": target.get("macro_uptrend", False),
                 "prev_tick_price": seed_price,
-                "last_tick_direction": 1,  # 1 = Buy, -1 = Sell (Lee-Ready persistence)
+                "last_tick_direction": 1,  # Direction persistence for flat ticks
                 "rolling_buy_vol": 0,
                 "rolling_sell_vol": 0,
                 "reject_count": 0,
                 "near_hod_streak": 0,
-                "last_alert_time": 0,
-                "dipped_below_vwap": False,
+                "last_alert_time": 0,  
+                "dipped_below_vwap": False,  
                 "dipped_below_vwap_time": 0,
-                "last_reclaim_alert_time": 0,
-                "session_low_price": seed_low,
-                "session_low_vwap_distance": None,
+                "last_reclaim_alert_time": 0,  
+                "session_low_price": seed_session_low_price,
+                "session_low_vwap_distance": None,  
                 "reclaim_streak": 0,
                 "last_pullback_alert_time": 0,
                 "last_breakout_alert_time": 0,
@@ -733,7 +787,7 @@ def register_symbol_in_memory(target: dict):
 
 
 # ==========================================
-# PHASE 2: EVALUATION & WATCHLIST BACKGROUND THREADS
+# PHASE 2: INDEPENDENT BACKGROUND THREADS
 # ==========================================
 def evaluation_loop():
     print("--- [THREAD] Independent 60-Second Evaluation Loop Started ---")
@@ -745,7 +799,7 @@ def evaluation_loop():
 
         uk_time = datetime.now(ZoneInfo("Europe/London"))
         timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n--- {timestamp_str} | 60-SECOND ALGORITHMIC VWAP SCANS ---")
+        print(f"\n--- {timestamp_str} | 60-SECOND ALGORITHMIC VWAP SCANS (RANKED BY SCORE) ---")
 
         # Session Time Calculations for Remaining Volume Projections
         now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -765,7 +819,7 @@ def evaluation_loop():
 
         # Power Hour Evaluation Window (15:15 to 15:58 ET)
         is_power_hour = (now_et.hour == 15 and 15 <= now_et.minute <= 58)
-
+        
         with data_lock:
             for sym, metrics in market_data.items():
                 p_change = metrics["percent_change"]
@@ -775,40 +829,51 @@ def evaluation_loop():
                 price_60s_ago = metrics["price_60s_ago"]
                 ma_5 = metrics["ma_5"]
                 alignment = metrics["alignment_state"]
-
+                
                 buy_v = metrics["rolling_buy_vol"]
                 sell_v = metrics["rolling_sell_vol"]
                 total_tick_vol = buy_v + sell_v
-
-                # Finding 5: Require minimum volume floor in 60s window before calculating delta
+                
+                # Require volume floor in 60s window before calculating delta
                 order_flow_delta_pct = 0.0
                 if total_tick_vol >= MIN_1M_ORDER_FLOW_VOLUME:
-                    order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100.0
-
+                    order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100
+                    
                 metrics["rolling_buy_vol"] = 0
                 metrics["rolling_sell_vol"] = 0
-
-                if cum_vol > 50000 and current_price > 0:
+                
+                if cum_vol > 50000 and current_price > 0: 
                     avg_price = metrics["total_dollar_traded"] / cum_vol
-                    vwap_distance = ((current_price - avg_price) / avg_price) * 100.0
-
+                    vwap_distance = ((current_price - avg_price) / avg_price) * 100
+                    
                     if -2.5 <= vwap_distance <= -0.2:
                         metrics["dipped_below_vwap"] = True
                         metrics["dipped_below_vwap_time"] = current_time
 
-                    if (vwap_distance < -3.0 or vwap_distance > 1.5 or
-                            (current_time - metrics["dipped_below_vwap_time"]) > MAX_DIP_AGE_SECONDS):
+                    if (vwap_distance < -3.0 or 
+                        vwap_distance > 1.5 or 
+                        (current_time - metrics["dipped_below_vwap_time"]) > MAX_DIP_AGE_SECONDS):
                         metrics["dipped_below_vwap"] = False
-
+                    
                     # Actual headroom: current price directly to HOD
                     upside_potential = ((hod_price - current_price) / current_price) * 100.0 if current_price > 0 else 0.0
+
                     dynamic_target = min(15.0, max(5.0, abs(p_change) * 0.40))
                     nearest_whole_dollar = round(current_price)
-                    is_converging = (current_price > 2.00) and (abs(current_price - nearest_whole_dollar) <= 0.05)
-                    is_bouncing = current_price > price_60s_ago
+                    is_converging = False
+                    if current_price > 2.00:
+                        cents_away = abs(current_price - nearest_whole_dollar)
+                        if cents_away <= 0.05:
+                            is_converging = True
 
-                    extension_pct = ((current_price - ma_5) / ma_5) * 100.0 if ma_5 > 0 else 0.0
-                    is_over_extended = extension_pct >= 50.0
+                    is_bouncing = current_price > price_60s_ago  
+                    
+                    extension_pct = 0.0
+                    is_over_extended = False
+                    if ma_5 > 0:
+                        extension_pct = ((current_price - ma_5) / ma_5) * 100
+                        if extension_pct >= 50.0:
+                            is_over_extended = True
 
                     session_low_vwap_dist = metrics["session_low_vwap_distance"]
                     if session_low_vwap_dist is None or vwap_distance < session_low_vwap_dist:
@@ -829,6 +894,7 @@ def evaluation_loop():
                             pullback_tier = tier
 
                     distance_to_hod_pct = max(0.0, upside_potential)
+
                     if distance_to_hod_pct <= 2.0:
                         metrics["near_hod_streak"] += 1
                     else:
@@ -838,17 +904,16 @@ def evaluation_loop():
                     pullback_in_cooldown = (current_time - metrics["last_pullback_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     reclaim_in_cooldown = (current_time - metrics["last_reclaim_alert_time"]) < ALERT_COOLDOWN_SECONDS
                     breakout_in_cooldown = (current_time - metrics["last_breakout_alert_time"]) < ALERT_COOLDOWN_SECONDS
-                    overnight_in_cooldown = (current_time - metrics["last_overnight_alert_time"]) < ALERT_COOLDOWN_SECONDS
+                    overnight_in_cooldown = (current_time - metrics.get("last_overnight_alert_time", 0)) < ALERT_COOLDOWN_SECONDS
 
                     distance_from_low_pct = 0.0
                     if metrics["session_low_price"] > 0:
-                        distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100.0
+                        distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100
 
                     day_spread = hod_price - metrics["session_low_price"]
-                    intraday_clv_pct = (
-                        (((current_price - metrics["session_low_price"]) - (hod_price - current_price)) / day_spread) * 100.0
-                        if day_spread > 0 else 0.0
-                    )
+                    intraday_clv_pct = 0.0
+                    if day_spread > 0:
+                        intraday_clv_pct = (((current_price - metrics["session_low_price"]) - (hod_price - current_price)) / day_spread) * 100.0
 
                     open_p = metrics.get("open_price", current_price)
                     intraday_return_pct = ((current_price - open_p) / open_p * 100.0) if open_p > 0 else 0.0
@@ -862,15 +927,12 @@ def evaluation_loop():
                     live_rvol = raw_rvol if raw_rvol is not None else (metrics.get("relative_volume") or 1.0)
                     metrics["relative_volume"] = live_rvol
 
-                    # --- REMAINING VOLUME AND RUNWAY METRICS ---
+                    # Remaining Volume & Runway Projections
                     vol_progress_pct = (cum_vol / avg_3m * 100.0) if avg_3m > 0 else 0.0
                     projected_remaining_vol = (avg_3m * remaining_session_fraction * live_rvol) if avg_3m > 0 else 0.0
                     remaining_vol_ratio = projected_remaining_vol / avg_3m if avg_3m > 0 else 0.0
 
-                    day_range_pct = (
-                        ((hod_price - metrics["session_low_price"]) / metrics["session_low_price"] * 100.0)
-                        if metrics["session_low_price"] > 0 else 0.0
-                    )
+                    day_range_pct = ((hod_price - metrics["session_low_price"]) / metrics["session_low_price"] * 100.0) if metrics["session_low_price"] > 0 else 0.0
                     adr_exhaustion_ratio = (day_range_pct / metrics["adr_pct"]) if metrics["adr_pct"] > 0 else 1.0
                     has_adr_fuel = (adr_exhaustion_ratio <= 1.35) or (live_rvol >= 3.0)
 
@@ -897,13 +959,13 @@ def evaluation_loop():
                     )
                     log_entries.append((setup_score, formatted_line))
 
-                    def build_signal_payload(sig_type, pb_tier, lvls):
+                    def build_signal_payload(signal_type_str, pb_tier_str, levels_dict):
                         return {
                             "symbol": sym,
-                            "signal_type": sig_type,
+                            "signal_type": signal_type_str,
                             "setup_score": setup_score,
                             "setup_class": setup_class,
-                            "pullback_tier": pb_tier,
+                            "pullback_tier": pb_tier_str,
                             "market_cap_tier": metrics["market_cap_tier"],
                             "live_percent_change": round(p_change, 2),
                             "intraday_return_pct": round(intraday_return_pct, 2),
@@ -926,352 +988,6 @@ def evaluation_loop():
                             "volume_progress_pct": round(vol_progress_pct, 1),
                             "projected_remaining_vol": int(projected_remaining_vol),
                             "remaining_volume_ratio": round(remaining_vol_ratio, 2),
-                            "volume_fuel_factor": lvls.get("volume_fuel_factor", 1.0),
+                            "volume_fuel_factor": levels_dict.get("volume_fuel_factor", 1.0),
                             "session_time_remaining_pct": round(remaining_session_fraction * 100.0, 1),
-                            "rvol": round(live_rvol, 2) if live_rvol else 0.0,
-                            "whole_dollar_convergence": is_converging,
-                            "target_entry_price": lvls["target_entry_price"],
-                            "tp1_price": lvls["tp1_price"],
-                            "take_profit_price": lvls["take_profit_price"],
-                            "stop_loss_price": lvls["stop_loss_price"],
-                            "estimated_tp1_gain_pct": lvls["estimated_tp1_gain_pct"],
-                            "estimated_gain_percentage": lvls["estimated_gain_percentage"],
-                            "reward_risk_ratio": lvls["reward_risk_ratio"],
-                            "session_low_price": round(metrics["session_low_price"], 2),
-                            "daily_alignment_state": alignment,
-                            "daily_macro_uptrend": metrics["macro_uptrend"],
-                            "trend_7d": metrics["trend_7d"],
-                            "green_red_7d": metrics["green_red_7d"],
-                            "ret_7d_pct": metrics["ret_7d_pct"],
-                            "vwap_20d": round(vwap_20d, 2),
-                            "vwap_20d_dist_pct": round(vwap_20d_dist_pct, 2),
-                            "daily_rsi": round(metrics["daily_rsi"], 1),
-                            "extension_from_5ma": round(extension_pct, 2),
-                            "is_over_extended": is_over_extended,
-                            "order_flow_delta_1m": round(order_flow_delta_pct, 2),
-                            "historical_adr_pct": round(metrics["adr_pct"], 2),
-                            "atr_14": metrics["atr_14"],
-                            "atr_pct": metrics["atr_pct"],
-                            "target_vs_adr_pct": target_vs_adr_pct,
-                            "adr_feasibility": adr_feasibility,
-                            "DateTime": timestamp_str
-                        }
-
-                    # ==============================================================
-                    # EXECUTION GATE 1: UNDER-VWAP RECLAIM (Threshold <= 0.6%)
-                    # ==============================================================
-                    # Finding 3: Reconciled bound to -0.5% to +0.6%
-                    if (metrics["dipped_below_vwap"] and
-                            alignment in ("FULL_BULLISH", "COMPRESSION") and
-                            -0.5 <= vwap_distance <= 0.6 and
-                            distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
-                            has_adr_fuel and
-                            is_bouncing and
-                            metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
-                            order_flow_delta_pct >= RECLAIM_MIN_ORDER_FLOW_DELTA_PCT and
-                            remaining_vol_ratio >= 0.15 and
-                            projected_remaining_vol >= 150_000 and
-                            not is_over_extended and
-                            not reclaim_in_cooldown):
-
-                        levels = calculate_trade_levels(
-                            "VWAP_RECLAIM_CROSSOVER", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
-                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
-                        )
-                        if levels:
-                            metrics["last_reclaim_alert_time"] = current_time
-                            metrics["dipped_below_vwap"] = False
-                            triggered_symbols.append(build_signal_payload("VWAP_RECLAIM_CROSSOVER", "NONE", levels))
-
-                    # ==============================================================
-                    # EXECUTION GATE 2: VWAP CONTINUATION (Threshold <= 0.4%)
-                    # ==============================================================
-                    # Finding 3: Reconciled bound to -0.5% to +0.4%
-                    elif (p_change >= 8.0 and
-                            upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target) and
-                            -0.5 <= vwap_distance <= 0.4 and
-                            order_flow_delta_pct >= 15.0 and
-                            live_rvol >= 2.0 and
-                            has_adr_fuel and
-                            is_bouncing and
-                            remaining_vol_ratio >= 0.15 and
-                            projected_remaining_vol >= 150_000 and
-                            not is_over_extended and
-                            not in_cooldown):
-
-                        levels = calculate_trade_levels(
-                            "VWAP_CONTINUATION_BOUNCE", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
-                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
-                        )
-                        if levels:
-                            metrics["last_alert_time"] = current_time
-                            triggered_symbols.append(build_signal_payload("VWAP_CONTINUATION_BOUNCE", "NONE", levels))
-
-                    # ==============================================================
-                    # EXECUTION GATE 3: DEEP PULLBACK REVERSAL (Natural 6% Mean Reversion)
-                    # ==============================================================
-                    elif (pullback_tier is not None and
-                            alignment in ("FULL_BULLISH", "COMPRESSION") and
-                            cum_vol >= 100000 and rvol_ok and
-                            vwap_distance <= -2.5 and
-                            distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
-                            distance_from_low_pct >= 1.0 and
-                            metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
-                            order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
-                            vol_progress_pct >= 40.0 and
-                            remaining_session_fraction >= 0.25 and
-                            projected_remaining_vol >= 250_000 and
-                            not pullback_in_cooldown):
-
-                        levels = calculate_trade_levels(
-                            "DEEP_PULLBACK_RECLAIM", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
-                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
-                        )
-                        if levels:
-                            metrics["last_pullback_alert_time"] = current_time
-                            triggered_symbols.append(build_signal_payload("DEEP_PULLBACK_RECLAIM", pullback_tier["name"], levels))
-
-                    # ==============================================================
-                    # EXECUTION GATE 5: EOD OVERNIGHT IGNITION (NEXT-DAY +6% GAP)
-                    # ==============================================================
-                    # Finding 2: Placed above Gate 4 to prioritize overnight positioning during Power Hour
-                    elif (is_power_hour and
-                            p_change >= 6.0 and
-                            distance_to_hod_pct <= 1.5 and
-                            intraday_clv_pct >= 80.0 and
-                            metrics["adr_pct"] >= 7.5 and
-                            vol_progress_pct >= 150.0 and
-                            live_rvol >= 2.0 and
-                            order_flow_delta_pct >= 20.0 and
-                            alignment == "FULL_BULLISH" and
-                            current_price > avg_price and
-                            not is_over_extended and
-                            not overnight_in_cooldown):
-
-                        levels = calculate_trade_levels(
-                            "EOD_OVERNIGHT_IGNITION", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
-                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
-                        )
-                        if levels:
-                            metrics["last_overnight_alert_time"] = current_time
-                            triggered_symbols.append(build_signal_payload("EOD_OVERNIGHT_IGNITION", "OVERNIGHT_SWING", levels))
-
-                    # ==============================================================
-                    # EXECUTION GATE 4: HIGH-OF-DAY (HOD) IGNITION BREAKOUT
-                    # ==============================================================
-                    # Finding 2: Suppressed during Power Hour to avoid late-session intraday entries
-                    elif (not is_power_hour and
-                            p_change >= 6.0 and
-                            1.0 < vwap_distance <= 8.0 and
-                            distance_to_hod_pct <= 1.5 and
-                            metrics["near_hod_streak"] >= 2 and
-                            intraday_clv_pct >= 70.0 and
-                            live_rvol >= 2.5 and
-                            remaining_vol_ratio >= 0.25 and
-                            is_bouncing and
-                            metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
-                            order_flow_delta_pct >= 30.0 and
-                            alignment == "FULL_BULLISH" and
-                            not is_over_extended and
-                            not breakout_in_cooldown):
-
-                        levels = calculate_trade_levels(
-                            "HOD_IGNITION_BREAKOUT", current_price, avg_price, hod_price,
-                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
-                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
-                        )
-                        if levels:
-                            metrics["last_breakout_alert_time"] = current_time
-                            triggered_symbols.append(build_signal_payload("HOD_IGNITION_BREAKOUT", "NONE", levels))
-
-                metrics["price_60s_ago"] = current_price
-
-        if log_entries:
-            log_entries.sort(key=lambda x: x[0], reverse=True)
-            for _, line in log_entries:
-                print(line)
-
-        if triggered_symbols:
-            triggered_symbols.sort(key=lambda x: x["setup_score"], reverse=True)
-            print(f"\n>>> FIRING N8N WEBHOOK: {len(triggered_symbols)} stocks qualified for execution! <<<")
-            payload = {
-                "scan_type": "multi_signal_scan",
-                "timestamp": current_time,
-                "top_ranked_symbols": triggered_symbols
-            }
-            threading.Thread(
-                target=lambda p: requests.post(N8N_WEBHOOK_URL, json=p, timeout=5),
-                args=(payload,),
-                daemon=True
-            ).start()
-
-
-def watchlist_refresher_loop():
-    print("--- [THREAD] Mid-Day Watchlist Refresher Loop Started ---")
-    while True:
-        time.sleep(REFRESH_INTERVAL_SECONDS)
-        try:
-            latest_targets = get_morning_watchlist()
-            if not latest_targets:
-                continue
-
-            syms_to_drop = []
-            syms_to_sub = []
-
-            # Finding 1: Isolate data dictionary state mutation strictly inside data_lock
-            with data_lock:
-                current_time = time.time()
-                current_active_syms = set(market_data.keys())
-                new_targets = [t for t in latest_targets if t["finnhub_symbol"] not in current_active_syms]
-
-                for t in new_targets:
-                    register_symbol_in_memory(t)
-
-                if len(market_data) > MAX_WATCHLIST_SYMBOLS:
-                    def eviction_priority(s):
-                        m = market_data[s]
-                        in_cool = any([
-                            (current_time - m.get("last_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
-                            (current_time - m.get("last_reclaim_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
-                            (current_time - m.get("last_pullback_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
-                            (current_time - m.get("last_breakout_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
-                            (current_time - m.get("last_overnight_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
-                        ])
-                        active_streak = m.get("reclaim_streak", 0) >= 2
-                        priority = m.get("morning_setup_score", 0.0)
-                        if in_cool or active_streak:
-                            priority += 1000.0
-                        return priority
-
-                    sorted_syms = sorted(market_data.keys(), key=eviction_priority, reverse=True)
-                    syms_to_keep = set(sorted_syms[:MAX_WATCHLIST_SYMBOLS])
-                    syms_to_drop = [s for s in market_data.keys() if s not in syms_to_keep]
-
-                    for s in syms_to_drop:
-                        del market_data[s]
-
-                syms_to_sub = [t["finnhub_symbol"] for t in new_targets if t["finnhub_symbol"] in market_data]
-
-            # Finding 1: Execute network calls and throttle sleep OUTSIDE the lock
-            for s in syms_to_drop:
-                send_ws_message({"type": "unsubscribe", "symbol": s})
-                time.sleep(0.03)
-
-            for sym in syms_to_sub:
-                send_ws_message({"type": "subscribe", "symbol": sym})
-                time.sleep(0.03)
-
-        except Exception as e:
-            print(f"Mid-day refresh error: {e}")
-
-
-# ==========================================
-# PHASE 3: WEBSOCKET EVENT LISTENERS
-# ==========================================
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        if data.get('type') == 'trade':
-            for trade in data['data']:
-                sym = trade['s']
-                price = trade['p']
-                vol = trade['v']
-                if price <= 0 or vol <= 0:
-                    continue
-
-                with data_lock:
-                    if sym in market_data:
-                        m = market_data[sym]
-                        prev_tick = m["prev_tick_price"]
-                        is_rebase = False
-
-                        if prev_tick > 0:
-                            tick_move_pct = abs(price - prev_tick) / prev_tick * 100.0
-                            if tick_move_pct > MAX_TICK_MOVE_PCT:
-                                m["reject_count"] = m.get("reject_count", 0) + 1
-                                if m["reject_count"] < 3:
-                                    continue
-                                print(f"  [REBASE] {sym} accepting ${price:.2f} ({tick_move_pct:+.1f}%) after 3 rejects")
-                                is_rebase = True
-
-                        m["reject_count"] = 0
-                        m["current_price"] = price
-                        m["cumulative_volume"] += vol
-                        m["total_dollar_traded"] += (price * vol)
-
-                        if price > m["high_of_day_price"]:
-                            m["high_of_day_price"] = price
-
-                        # Stateful Lee-Ready Tick Rule (Direction Persistence for Flat Ticks)
-                        if prev_tick > 0 and not is_rebase:
-                            if price > prev_tick:
-                                m["last_tick_direction"] = 1
-                            elif price < prev_tick:
-                                m["last_tick_direction"] = -1
-
-                            if m["last_tick_direction"] == 1:
-                                m["rolling_buy_vol"] += vol
-                            else:
-                                m["rolling_sell_vol"] += vol
-
-                        m["prev_tick_price"] = price
-                        prev_close = m["prev_close"]
-                        if prev_close > 0:
-                            m["percent_change"] = ((price - prev_close) / prev_close) * 100.0
-
-    except json.JSONDecodeError:
-        pass
-    except Exception as e:
-        print(f"WebSocket processing error: {e}")
-
-
-def on_error(ws, error):
-    print(f"WebSocket Error: {error}")
-
-
-def on_close(ws, close_status_code, close_msg):
-    global ws_global
-    ws_global = None
-    print("### WebSocket Connection Closed ###")
-
-
-def on_open(ws):
-    global ws_global
-    ws_global = ws
-    print("### WebSocket Connection Established ###")
-    with data_lock:
-        symbols_to_sub = list(market_data.keys())
-    for sym in symbols_to_sub:
-        send_ws_message({"type": "subscribe", "symbol": sym})
-        time.sleep(0.03)
-
-
-# ==========================================
-# ENTRY POINT
-# ==========================================
-if __name__ == "__main__":
-    websocket.enableTrace(False)
-    initial_targets = get_morning_watchlist()
-    for target in initial_targets:
-        register_symbol_in_memory(target)
-
-    threading.Thread(target=evaluation_loop, daemon=True).start()
-    threading.Thread(target=watchlist_refresher_loop, daemon=True).start()
-
-    while True:
-        try:
-            ws = websocket.WebSocketApp(
-                f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-            ws.run_forever(ping_interval=30, ping_timeout=10)
-        except Exception as e:
-            print(f"WebSocket reconnect loop error: {e}")
-        time.sleep(15)
+                            "rvol": round(live_
