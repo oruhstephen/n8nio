@@ -49,7 +49,7 @@ PAGE_SIZE = 250
 
 # Target Calibration Parameters (+6% Target Engine)
 MIN_TARGET_GAIN_PCT = 6.0          # Hard floor for Take Profit 2
-MIN_ADR_PCT = 1.0                  # Baseline statistical daily range required to qualify
+MIN_ADR_PCT = 7.0                  # Baseline statistical daily range required to qualify
 MAX_STOP_LOSS_PCT = 3.8            # Maximum allowable risk; rejects trade if structural stop exceeds this
 MIN_1M_ORDER_FLOW_VOLUME = 500     # Minimum volume in 60s window to calculate valid order flow delta
 
@@ -118,7 +118,7 @@ def get_mcap_tier(mcap: float) -> str:
     return "Micro Cap (<$300M)"
 
 
-def calculate_relative_volume(day_volume, avg_vol_3m):
+def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | None:
     if not avg_vol_3m or avg_vol_3m <= 0 or not day_volume or day_volume <= 0:
         return None
 
@@ -143,7 +143,7 @@ def calculate_relative_volume(day_volume, avg_vol_3m):
     return round(day_volume / expected_volume, 2) if expected_volume > 0 else None
 
 
-def evaluate_adr_feasibility(upside_potential: float, adr_pct: float):
+def evaluate_adr_feasibility(upside_potential: float, adr_pct: float) -> tuple[float, str]:
     if not adr_pct or adr_pct <= 0:
         return 0.0, "Unknown ADR"
 
@@ -206,7 +206,7 @@ def calculate_trade_levels(
     """
     Deterministic institutional execution engine featuring empirical volatility,
     catalyst volatility expansion, dynamic volume fuel factor scaling,
-    structural stop-loss integrity, and wall penetration logic.
+    structural stop-loss integrity, and safe wall penetration logic.
     """
     day_range_pct = ((hod_price - session_low_price) / session_low_price * 100.0) if session_low_price > 0 else 0.0
     is_active_catalyst = (live_rvol >= EPISODIC_PIVOT_RVOL or vol_progress_pct >= 150.0)
@@ -258,9 +258,9 @@ def calculate_trade_levels(
             raw_tp2 = max(raw_tp2, eff_hod * (1.0 + (eff_adr / 100.0) * 0.15))
 
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        # Whole-dollar punch-through on high-fuel reclaim if wall drops gain below threshold
+        # Safe barrier clearance: guarantees >= 6.0% gain without integer truncation drops
         if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
-            tp2 = round(int(raw_tp2) + 0.20, 2)
+            tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
 
@@ -286,9 +286,9 @@ def calculate_trade_levels(
         raw_tp2 = entry * (1.0 + (expansion_pct / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
 
-        # Whole-dollar punch-through on high-fuel breakout
+        # Safe barrier clearance: guarantees >= 6.0% gain without integer truncation drops
         if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
-            tp2 = round(int(raw_tp2) + 0.20, 2)
+            tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
 
@@ -302,7 +302,7 @@ def calculate_trade_levels(
         raw_tp2 = entry * (1.0 + (target_gain_pct / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
         if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
-            tp2 = round(int(raw_tp2) + 0.20, 2)
+            tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
 
@@ -446,7 +446,7 @@ def score_intraday_setup(
 # ==========================================
 # PHASE 1: SCREENER (HARVEST 1250 -> SHORTLIST 100 -> SCORE ALL -> SLICE 40)
 # ==========================================
-def get_morning_watchlist():
+def get_morning_watchlist() -> list[dict]:
     print(f"\n--- SCREENING MARKET: HARVEST {HARVEST_TARGET_COUNT} -> SHORTLIST 100 -> ADR FILTER -> SLICE 40 ---")
     try:
         q = EquityQuery('and', [
@@ -730,7 +730,7 @@ def get_morning_watchlist():
         return []
 
 
-def register_symbol_in_memory(target):
+def register_symbol_in_memory(target: dict):
     sym = target["finnhub_symbol"]
     with data_lock:
         if sym not in market_data:
@@ -791,34 +791,57 @@ def register_symbol_in_memory(target):
 # ==========================================
 def evaluation_loop():
     print("--- [THREAD] Independent 60-Second Evaluation Loop Started ---")
+    last_session_date = None
+
     while True:
         time.sleep(60)
         current_time = time.time()
         triggered_symbols = []
         log_entries = []
 
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        current_date = now_et.date()
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+        # Multi-day daemon state reset at 09:30 ET
+        if last_session_date != current_date and now_et >= market_open:
+            with data_lock:
+                print(f"\n--- [SESSION RESET] Re-indexing intraday market state for {current_date} ---")
+                for sym, m in market_data.items():
+                    m["cumulative_volume"] = 0
+                    m["total_dollar_traded"] = 0.0
+                    m["high_of_day_price"] = m["current_price"]
+                    m["session_low_price"] = m["current_price"]
+                    m["session_low_vwap_distance"] = None
+                    m["dipped_below_vwap"] = False
+                    m["reclaim_streak"] = 0
+                    m["near_hod_streak"] = 0
+                    m["rolling_buy_vol"] = 0
+                    m["rolling_sell_vol"] = 0
+            last_session_date = current_date
+
+        # Guard: Restrict execution gate logic strictly to regular market hours
+        is_market_session = (market_open <= now_et < market_close)
+        if not is_market_session:
+            with data_lock:
+                for sym, metrics in market_data.items():
+                    metrics["price_60s_ago"] = metrics["current_price"]
+            continue
+
         uk_time = datetime.now(ZoneInfo("Europe/London"))
         timestamp_str = uk_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n--- {timestamp_str} | 60-SECOND ALGORITHMIC VWAP SCANS (RANKED BY SCORE) ---")
 
-        # Session Time Calculations for Remaining Volume Projections
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
         session_minutes = 390.0
-
-        if now_et <= market_open:
-            elapsed_minutes = 1.0
-        elif now_et >= market_close:
-            elapsed_minutes = session_minutes
-        else:
-            elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
-
-        t_session = elapsed_minutes / session_minutes
+        elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
+        t_session = min(1.0, elapsed_minutes / session_minutes)
         remaining_session_fraction = max(0.0, 1.0 - t_session)
 
         # Power Hour Evaluation Window (15:15 to 15:58 ET)
         is_power_hour = (now_et.hour == 15 and 15 <= now_et.minute <= 58)
+        # Avoid erratic prints in the opening 5 minutes for HOD breakouts
+        is_settled_market = (now_et >= market_open.replace(minute=35))
         
         with data_lock:
             for sym, metrics in market_data.items():
@@ -837,14 +860,14 @@ def evaluation_loop():
                 # Require volume floor in 60s window before calculating delta
                 order_flow_delta_pct = 0.0
                 if total_tick_vol >= MIN_1M_ORDER_FLOW_VOLUME:
-                    order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100
+                    order_flow_delta_pct = ((buy_v - sell_v) / total_tick_vol) * 100.0
                     
                 metrics["rolling_buy_vol"] = 0
                 metrics["rolling_sell_vol"] = 0
                 
                 if cum_vol > 50000 and current_price > 0: 
                     avg_price = metrics["total_dollar_traded"] / cum_vol
-                    vwap_distance = ((current_price - avg_price) / avg_price) * 100
+                    vwap_distance = ((current_price - avg_price) / avg_price) * 100.0
                     
                     if -2.5 <= vwap_distance <= -0.2:
                         metrics["dipped_below_vwap"] = True
@@ -871,7 +894,7 @@ def evaluation_loop():
                     extension_pct = 0.0
                     is_over_extended = False
                     if ma_5 > 0:
-                        extension_pct = ((current_price - ma_5) / ma_5) * 100
+                        extension_pct = ((current_price - ma_5) / ma_5) * 100.0
                         if extension_pct >= 50.0:
                             is_over_extended = True
 
@@ -908,7 +931,7 @@ def evaluation_loop():
 
                     distance_from_low_pct = 0.0
                     if metrics["session_low_price"] > 0:
-                        distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100
+                        distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100.0
 
                     day_spread = hod_price - metrics["session_low_price"]
                     intraday_clv_pct = 0.0
@@ -990,4 +1013,146 @@ def evaluation_loop():
                             "remaining_volume_ratio": round(remaining_vol_ratio, 2),
                             "volume_fuel_factor": levels_dict.get("volume_fuel_factor", 1.0),
                             "session_time_remaining_pct": round(remaining_session_fraction * 100.0, 1),
-                            "rvol": round(live_
+                            "rvol": round(live_rvol, 2) if live_rvol else 0.0,
+                            "whole_dollar_convergence": is_converging,
+                            "target_entry_price": levels_dict["target_entry_price"],
+                            "tp1_price": levels_dict["tp1_price"],
+                            "take_profit_price": levels_dict["take_profit_price"],
+                            "stop_loss_price": levels_dict["stop_loss_price"],
+                            "estimated_tp1_gain_pct": levels_dict["estimated_tp1_gain_pct"],
+                            "estimated_gain_percentage": levels_dict["estimated_gain_percentage"],
+                            "reward_risk_ratio": levels_dict["reward_risk_ratio"],
+                            "session_low_price": round(metrics["session_low_price"], 2),
+                            "daily_alignment_state": alignment,
+                            "daily_macro_uptrend": metrics["macro_uptrend"],
+                            "trend_7d": metrics["trend_7d"],
+                            "green_red_7d": metrics["green_red_7d"],
+                            "ret_7d_pct": metrics["ret_7d_pct"],
+                            "vwap_20d": round(vwap_20d, 2),
+                            "vwap_20d_dist_pct": round(vwap_20d_dist_pct, 2),
+                            "daily_rsi": round(metrics["daily_rsi"], 1),
+                            "extension_from_5ma": round(extension_pct, 2),
+                            "is_over_extended": is_over_extended,
+                            "order_flow_delta_1m": round(order_flow_delta_pct, 2),
+                            "historical_adr_pct": round(metrics["adr_pct"], 2),
+                            "atr_14": metrics["atr_14"],
+                            "atr_pct": metrics["atr_pct"],
+                            "target_vs_adr_pct": target_vs_adr_pct,
+                            "adr_feasibility": adr_feasibility,
+                            "DateTime": timestamp_str
+                        }
+
+                    # ==============================================================
+                    # EXECUTION GATE 1: UNDER-VWAP RECLAIM (Threshold <= 0.6%)
+                    # ==============================================================
+                    if (metrics["dipped_below_vwap"] and
+                        alignment in ("FULL_BULLISH", "COMPRESSION") and  
+                        -0.5 <= vwap_distance <= 0.6 and
+                        distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
+                        has_adr_fuel and
+                        is_bouncing and
+                        metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
+                        order_flow_delta_pct >= RECLAIM_MIN_ORDER_FLOW_DELTA_PCT and
+                        remaining_vol_ratio >= 0.15 and
+                        projected_remaining_vol >= 150_000 and
+                        not is_over_extended and
+                        not reclaim_in_cooldown):
+
+                        levels = calculate_trade_levels(
+                            "VWAP_RECLAIM_CROSSOVER", current_price, avg_price, hod_price,
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
+                        )
+                        if levels:
+                            metrics["last_reclaim_alert_time"] = current_time
+                            metrics["dipped_below_vwap"] = False  
+                            triggered_symbols.append(
+                                build_signal_payload("VWAP_RECLAIM_CROSSOVER", "NONE", levels)
+                            )
+
+                    # ==============================================================
+                    # EXECUTION GATE 2: VWAP CONTINUATION (Threshold <= 0.4%)
+                    # ==============================================================
+                    elif (p_change >= 8.0 and 
+                          upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target) and 
+                          -0.5 <= vwap_distance <= 0.4 and 
+                          order_flow_delta_pct >= 15.0 and
+                          live_rvol >= 2.0 and
+                          has_adr_fuel and
+                          is_bouncing and 
+                          remaining_vol_ratio >= 0.15 and
+                          projected_remaining_vol >= 150_000 and
+                          not is_over_extended and
+                          not in_cooldown):
+                        
+                        levels = calculate_trade_levels(
+                            "VWAP_CONTINUATION_BOUNCE", current_price, avg_price, hod_price,
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
+                        )
+                        if levels:
+                            metrics["last_alert_time"] = current_time  
+                            triggered_symbols.append(
+                                build_signal_payload("VWAP_CONTINUATION_BOUNCE", "NONE", levels)
+                            )
+
+                    # ==============================================================
+                    # EXECUTION GATE 3: DEEP PULLBACK REVERSAL (Natural 6% Mean Reversion)
+                    # ==============================================================
+                    elif (pullback_tier is not None and
+                          alignment in ("FULL_BULLISH", "COMPRESSION") and  
+                          cum_vol >= 100000 and rvol_ok and
+                          vwap_distance <= -2.5 and 
+                          distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
+                          distance_from_low_pct >= 1.0 and 
+                          metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
+                          order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
+                          vol_progress_pct >= 40.0 and
+                          remaining_session_fraction >= 0.25 and
+                          projected_remaining_vol >= 250_000 and
+                          not pullback_in_cooldown):
+
+                        levels = calculate_trade_levels(
+                            "DEEP_PULLBACK_RECLAIM", current_price, avg_price, hod_price,
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
+                        )
+                        if levels:
+                            metrics["last_pullback_alert_time"] = current_time
+                            triggered_symbols.append(
+                                build_signal_payload("DEEP_PULLBACK_RECLAIM", pullback_tier["name"], levels)
+                            )
+
+                    # ==============================================================
+                    # EXECUTION GATE 5: EOD OVERNIGHT IGNITION (NEXT-DAY +6% GAP)
+                    # Placed above Gate 4 to prioritize overnight accumulation during Power Hour
+                    # ==============================================================
+                    elif (is_power_hour and
+                          p_change >= 6.0 and
+                          distance_to_hod_pct <= 1.5 and
+                          intraday_clv_pct >= 80.0 and
+                          metrics["adr_pct"] >= 7.5 and
+                          vol_progress_pct >= 150.0 and
+                          live_rvol >= 2.0 and
+                          order_flow_delta_pct >= 20.0 and
+                          alignment == "FULL_BULLISH" and
+                          current_price > avg_price and
+                          not is_over_extended and
+                          not overnight_in_cooldown):
+
+                        levels = calculate_trade_levels(
+                            "EOD_OVERNIGHT_IGNITION", current_price, avg_price, hod_price,
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
+                        )
+                        if levels:
+                            metrics["last_overnight_alert_time"] = current_time
+                            triggered_symbols.append(
+                                build_signal_payload("EOD_OVERNIGHT_IGNITION", "OVERNIGHT_SWING", levels)
+                            )
+
+                    # ==============================================================
+                    # EXECUTION GATE 4: HIGH-OF-DAY (HOD) IGNITION BREAKOUT
+                    # Suppressed during Power Hour and before 09:35 ET
+                    # ==============================================================
+                    elif (not is_power_hour
