@@ -49,7 +49,7 @@ PAGE_SIZE = 250
 
 # Target Calibration Parameters (+6% Target Engine)
 MIN_TARGET_GAIN_PCT = 6.0          # Hard floor for Take Profit 2
-MIN_ADR_PCT = 7.0                  # Baseline statistical daily range required to qualify
+MIN_ADR_PCT = 1.0                  # Baseline statistical daily range required to qualify
 MAX_STOP_LOSS_PCT = 3.8            # Maximum allowable risk; rejects trade if structural stop exceeds this
 MIN_1M_ORDER_FLOW_VOLUME = 500     # Minimum volume in 60s window to calculate valid order flow delta
 
