@@ -164,8 +164,8 @@ def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
     """
     Front-runs psychological whole-dollar and half-dollar resistance walls.
     Eliminates float rounding noise.
-    - Stocks > $2.00:$X.00 to $X.08 ->$(X-1).97
-    - Stocks $1.00 to $5.00:$X.50 to $X.54 ->$(X).47
+    - Stocks > $2.00: $X.00 to $X.08 -> $(X-1).97
+    - Stocks $1.00 to $5.00: $X.50 to $X.54 -> $(X).47
     """
     if target_price <= 1.00:
         return round(target_price, 2)
@@ -173,13 +173,13 @@ def adjust_for_whole_dollar(target_price: float, entry_price: float) -> float:
     whole_dollar = int(target_price)
     cents = round(target_price - whole_dollar, 2)
 
-    # Whole dollar barrier: $X.00 -$X.08
+    # Whole dollar barrier: $X.00 - $X.08
     if 0.0 <= cents <= 0.08 and whole_dollar > entry_price:
         adjusted = whole_dollar - 0.03
         if adjusted > entry_price * 1.01:
             return round(adjusted, 2)
 
-    # Half-dollar barrier for low-priced equities ($1.00 to $5.00): $X.50 -$X.54
+    # Half-dollar barrier for low-priced equities ($1.00 to $5.00): $X.50 - $X.54
     if 1.00 <= target_price <= 5.00:
         if 0.50 <= cents <= 0.54 and (whole_dollar + 0.50) > entry_price:
             adjusted = whole_dollar + 0.47
@@ -1155,4 +1155,229 @@ def evaluation_loop():
                     # EXECUTION GATE 4: HIGH-OF-DAY (HOD) IGNITION BREAKOUT
                     # Suppressed during Power Hour and before 09:35 ET
                     # ==============================================================
-                    elif (not is_power_hour
+                    elif (not is_power_hour and is_settled_market and
+                          p_change >= 6.0 and
+                          1.0 < vwap_distance <= 8.0 and
+                          distance_to_hod_pct <= 1.5 and
+                          metrics["near_hod_streak"] >= 2 and     
+                          intraday_clv_pct >= 70.0 and            
+                          live_rvol >= 2.5 and
+                          remaining_vol_ratio >= 0.25 and
+                          is_bouncing and
+                          metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
+                          order_flow_delta_pct >= 30.0 and
+                          alignment == "FULL_BULLISH" and
+                          not is_over_extended and
+                          not breakout_in_cooldown):
+
+                        levels = calculate_trade_levels(
+                            "HOD_IGNITION_BREAKOUT", current_price, avg_price, hod_price,
+                            metrics["session_low_price"], metrics["adr_pct"], metrics["atr_14"], metrics["atr_pct"],
+                            live_rvol, order_flow_delta_pct, remaining_vol_ratio, vol_progress_pct
+                        )
+                        if levels:
+                            metrics["last_breakout_alert_time"] = current_time
+                            triggered_symbols.append(
+                                build_signal_payload("HOD_IGNITION_BREAKOUT", "NONE", levels)
+                            )
+
+                metrics["price_60s_ago"] = current_price
+
+        # Print all lines sorted by setup_score descending
+        if log_entries:
+            log_entries.sort(key=lambda x: x[0], reverse=True)
+            for _, line in log_entries:
+                print(line)
+
+        if triggered_symbols:
+            triggered_symbols = sorted(triggered_symbols, key=lambda x: x["setup_score"], reverse=True)
+            print(f"\n>>> FIRING N8N WEBHOOK! {len(triggered_symbols)} stocks triggered algorithmic execution! <<<")
+            payload = {
+                "scan_type": "multi_signal_scan",
+                "timestamp": current_time,
+                "top_ranked_symbols": triggered_symbols
+            }
+
+            def post_webhook(p):
+                try:
+                    resp = requests.post(N8N_WEBHOOK_URL, json=p, timeout=5)
+                    if resp.status_code >= 400:
+                        print(f"  [WEBHOOK ERR] n8n returned HTTP {resp.status_code}: {resp.text}")
+                except Exception as ex:
+                    print(f"  [WEBHOOK EXCEPTION] Failed to dispatch payload to n8n: {ex}")
+
+            threading.Thread(target=post_webhook, args=(payload,), daemon=True).start()
+
+
+def watchlist_refresher_loop():
+    print("--- [THREAD] Mid-Day Watchlist Refresher Loop Started ---")
+    while True:
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+        try:
+            latest_targets = get_morning_watchlist()
+            if not latest_targets:
+                continue
+
+            syms_to_drop = []
+            syms_to_sub = []
+
+            # Isolate dictionary state updates inside data_lock
+            with data_lock:
+                current_time = time.time()
+                current_active_syms = set(market_data.keys())
+                new_targets = [t for t in latest_targets if t["finnhub_symbol"] not in current_active_syms]
+
+                if new_targets:
+                    for t in new_targets:
+                        register_symbol_in_memory(t)
+
+                if len(market_data) > MAX_WATCHLIST_SYMBOLS:
+                    def eviction_priority(s):
+                        m = market_data[s]
+                        in_cool = any([
+                            (current_time - m.get("last_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                            (current_time - m.get("last_reclaim_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                            (current_time - m.get("last_pullback_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                            (current_time - m.get("last_breakout_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                            (current_time - m.get("last_overnight_alert_time", 0)) < ALERT_COOLDOWN_SECONDS,
+                        ])
+                        active_streak = m.get("reclaim_streak", 0) >= 2
+                        priority = m.get("morning_setup_score", 0.0)
+                        if in_cool or active_streak:
+                            priority += 1000.0  # Shield active runners
+                        return priority
+
+                    sorted_syms = sorted(market_data.keys(), key=eviction_priority, reverse=True)
+                    syms_to_keep = set(sorted_syms[:MAX_WATCHLIST_SYMBOLS])
+                    syms_to_drop = [s for s in market_data.keys() if s not in syms_to_keep]
+
+                    for s in syms_to_drop:
+                        del market_data[s]
+
+                syms_to_sub = [t["finnhub_symbol"] for t in new_targets if t["finnhub_symbol"] in market_data]
+
+            # Execute network calls and throttle sleep OUTSIDE the lock to eliminate lock contention
+            for s in syms_to_drop:
+                send_ws_message({"type": "unsubscribe", "symbol": s})
+                time.sleep(0.03)
+
+            for sym in syms_to_sub:
+                send_ws_message({"type": "subscribe", "symbol": sym})
+                time.sleep(0.03)
+
+        except Exception as e:
+            print(f"Mid-day refresh error: {e}")
+
+
+# ==========================================
+# PHASE 3: WEBSOCKET EVENT LISTENERS
+# ==========================================
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get('type') == 'trade':
+            for trade in data['data']:
+                sym = trade['s']
+                price = trade['p']
+                vol = trade['v']
+                if price <= 0 or vol <= 0:
+                    continue
+
+                with data_lock:
+                    if sym in market_data:
+                        m = market_data[sym]
+                        prev_tick = m["prev_tick_price"]
+                        is_rebase = False
+
+                        if prev_tick > 0:
+                            tick_move_pct = abs(price - prev_tick) / prev_tick * 100.0
+
+                            # Dynamic bad-print / volatility guard with 3-strike rebase
+                            if tick_move_pct > MAX_TICK_MOVE_PCT:
+                                m["reject_count"] = m.get("reject_count", 0) + 1
+                                if m["reject_count"] < 3:
+                                    continue  # Treat as transient bad tick
+                                
+                                # 3 consecutive prints confirm genuine displacement (e.g. halt resumption)
+                                print(f"  [REBASE] {sym} accepting ${price:.2f} ({tick_move_pct:+.1f}%) after 3 consecutive rejects")
+                                is_rebase = True
+
+                        # Reset reject counter on valid print or confirmed rebase
+                        m["reject_count"] = 0
+
+                        # Update state
+                        m["current_price"] = price
+                        m["cumulative_volume"] += vol
+                        m["total_dollar_traded"] += (price * vol)
+
+                        if price > m["high_of_day_price"]:
+                            m["high_of_day_price"] = price
+
+                        # Stateful Lee-Ready Tick Rule (Direction Persistence for Flat Ticks)
+                        if prev_tick > 0 and not is_rebase:
+                            if price > prev_tick:
+                                m["last_tick_direction"] = 1
+                            elif price < prev_tick:
+                                m["last_tick_direction"] = -1
+
+                            if m["last_tick_direction"] == 1:
+                                m["rolling_buy_vol"] += vol
+                            else:
+                                m["rolling_sell_vol"] += vol
+
+                        m["prev_tick_price"] = price
+                        prev_close = m["prev_close"]
+                        if prev_close > 0:
+                            m["percent_change"] = ((price - prev_close) / prev_close) * 100.0
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        print(f"WebSocket processing error: {e}")
+
+
+def on_error(ws, error):
+    print(f"WebSocket Error: {error}")
+
+
+def on_close(ws, close_status_code, close_msg):
+    global ws_global
+    ws_global = None
+    print("### WebSocket Connection Closed ###")
+
+
+def on_open(ws):
+    global ws_global
+    ws_global = ws
+    print("### WebSocket Connection Established ###")
+    with data_lock:
+        symbols_to_sub = list(market_data.keys())
+    for sym in symbols_to_sub:
+        send_ws_message({"type": "subscribe", "symbol": sym})
+        time.sleep(0.03)
+
+
+# ==========================================
+# ENTRY POINT
+# ==========================================
+if __name__ == "__main__":
+    websocket.enableTrace(False)
+    initial_targets = get_morning_watchlist()
+    for target in initial_targets:
+        register_symbol_in_memory(target)
+        
+    threading.Thread(target=evaluation_loop, daemon=True).start()
+    threading.Thread(target=watchlist_refresher_loop, daemon=True).start()
+    
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}",
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            print(f"WebSocket reconnect loop error: {e}")
+        time.sleep(15)
