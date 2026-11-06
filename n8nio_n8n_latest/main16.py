@@ -547,7 +547,8 @@ def get_morning_watchlist() -> list[dict]:
             return []
 
         print(f"Downloading 4-month historical metrics for {len(sym_list)} shortlisted candidates...")
-        hist_data = yf.download(sym_list, period="4mo", progress=False, group_by='column')
+        # threads=False prevents SQLite database locks in yfinance cache
+        hist_data = yf.download(sym_list, period="4mo", progress=False, group_by='column', threads=False)
 
         def extract_series(data_frame, col_name, ticker):
             if col_name not in data_frame:
@@ -791,7 +792,8 @@ def register_symbol_in_memory(target: dict):
 # ==========================================
 def evaluation_loop():
     print("--- [THREAD] Independent 60-Second Evaluation Loop Started ---")
-    last_session_date = None
+    # Initialize with current ET date so midday startups do not wipe seeded volume
+    last_session_date = datetime.now(ZoneInfo("America/New_York")).date()
 
     while True:
         time.sleep(60)
@@ -804,21 +806,16 @@ def evaluation_loop():
         market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
 
-        # Multi-day daemon state reset at 09:30 ET
+        # Multi-day daemon state reset at 09:30 ET: Re-seed from fresh morning watchlist
         if last_session_date != current_date and now_et >= market_open:
-            with data_lock:
-                print(f"\n--- [SESSION RESET] Re-indexing intraday market state for {current_date} ---")
-                for sym, m in market_data.items():
-                    m["cumulative_volume"] = 0
-                    m["total_dollar_traded"] = 0.0
-                    m["high_of_day_price"] = m["current_price"]
-                    m["session_low_price"] = m["current_price"]
-                    m["session_low_vwap_distance"] = None
-                    m["dipped_below_vwap"] = False
-                    m["reclaim_streak"] = 0
-                    m["near_hod_streak"] = 0
-                    m["rolling_buy_vol"] = 0
-                    m["rolling_sell_vol"] = 0
+            print(f"\n--- [SESSION RESET] Re-seeding intraday market state for {current_date} ---")
+            try:
+                refreshed_targets = get_morning_watchlist()
+                with data_lock:
+                    for target in refreshed_targets:
+                        register_symbol_in_memory(target)
+            except Exception as e:
+                print(f"  [RESET WARN] Failed to re-seed session: {e}")
             last_session_date = current_date
 
         # Guard: Restrict execution gate logic strictly to regular market hours
@@ -840,7 +837,7 @@ def evaluation_loop():
 
         # Power Hour Evaluation Window (15:15 to 15:58 ET)
         is_power_hour = (now_et.hour == 15 and 15 <= now_et.minute <= 58)
-        # Avoid erratic prints in the opening 5 minutes for HOD breakouts
+        # Avoid erratic opening uncross prints for HOD breakouts
         is_settled_market = (now_et >= market_open.replace(minute=35))
         
         with data_lock:
