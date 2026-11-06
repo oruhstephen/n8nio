@@ -974,7 +974,7 @@ def evaluation_loop():
                         f"7D: {metrics['trend_7d']:<7} ({metrics['green_red_7d']:<7}) | "
                         f"Delta: {order_flow_delta_pct:>+5.1f}% | VWAPDist: {vwap_distance:>+5.2f}% | "
                         f"RemVol: {projected_remaining_vol/1000:>5.0f}k ({remaining_vol_ratio:>4.2f}x) | "
-                        f"ADR: {metrics['adr_pct']:>4.2f}% | ATR: ${metrics['atr_14']:.2f} | "
+                        f"ADR: {metrics['adr_pct']:>4.2f}% | ATR: ${metrics['atr_14']:.2f} ({metrics['atr_pct']:.1f}%) | "
                         f"Up2HOD: {upside_potential:>5.2f}% | Streak: {metrics['reclaim_streak']}"
                     )
                     log_entries.append((setup_score, formatted_line))
