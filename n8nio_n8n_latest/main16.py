@@ -135,7 +135,7 @@ def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | N
         elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
 
     t = elapsed_minutes / session_minutes
-    # Front-loaded institutional U-curve: heavy morning volume, flat midday, acceleration into close
+    # Front-loaded institutional U-curve volume progression
     expected_fraction = 0.25 * np.sqrt(t) + 0.50 * t + 0.25 * (t ** 3)
     expected_fraction = max(0.01, min(1.0, float(expected_fraction)))
 
@@ -205,8 +205,8 @@ def calculate_trade_levels(
 ) -> dict | None:
     """
     Deterministic institutional execution engine featuring empirical volatility,
-    catalyst volatility expansion, volume fuel factor scaling anchored to live RVOL,
-    structural stop-loss integrity, and safe wall penetration logic.
+    catalyst volatility expansion, live-RVOL volume fuel factor scaling,
+    structural stop-loss integrity, and safe whole-dollar clearance logic.
     """
     day_range_pct = ((hod_price - session_low_price) / session_low_price * 100.0) if session_low_price > 0 else 0.0
     is_active_catalyst = (live_rvol >= EPISODIC_PIVOT_RVOL or vol_progress_pct >= 150.0)
@@ -725,6 +725,107 @@ def get_morning_watchlist() -> list[dict]:
         )
         top_40 = fully_scored_candidates[:MAX_WATCHLIST_SYMBOLS]
         
+        # Seed true VWAP and historical dip/low states from 1-minute intraday bars for the top watchlist
+        top_sym_list = [t["symbol"] for t in top_40]
+        if top_sym_list:
+            print(f"Downloading 1-minute bars to seed precision intraday VWAP & dip history for {len(top_sym_list)} targets...")
+            try:
+                bars_1m = yf.download(
+                    top_sym_list,
+                    period="1d",
+                    interval="1m",
+                    progress=False,
+                    group_by='column',
+                    threads=False
+                )
+                current_unix = time.time()
+                for target in top_40:
+                    sym = target["symbol"]
+                    c_1m = extract_series(bars_1m, 'Close', sym)
+                    h_1m = extract_series(bars_1m, 'High', sym)
+                    l_1m = extract_series(bars_1m, 'Low', sym)
+                    v_1m = extract_series(bars_1m, 'Volume', sym)
+
+                    if c_1m is not None and h_1m is not None and l_1m is not None and v_1m is not None and len(c_1m) > 0:
+                        common_idx = c_1m.index.intersection(h_1m.index).intersection(l_1m.index).intersection(v_1m.index)
+                        if len(common_idx) > 0:
+                            common_idx = common_idx.sort_values()
+                            h_sub = h_1m.loc[common_idx]
+                            l_sub = l_1m.loc[common_idx]
+                            c_sub = c_1m.loc[common_idx]
+                            v_sub = v_1m.loc[common_idx].fillna(0)
+
+                            typ_p = (h_sub + l_sub + c_sub) / 3.0
+                            dollar_bars = typ_p * v_sub
+                            
+                            cum_v = v_sub.cumsum()
+                            cum_d = dollar_bars.cumsum()
+
+                            dollar_traded = float(cum_d.iloc[-1])
+                            total_bar_vol = float(cum_v.iloc[-1])
+
+                            if total_bar_vol > 0 and dollar_traded > 0:
+                                true_vwap = dollar_traded / total_bar_vol
+                                quote_vol = float(target.get("day_volume", 0))
+
+                                if quote_vol > total_bar_vol:
+                                    target["seed_dollar_traded"] = float(true_vwap * quote_vol)
+                                else:
+                                    target["seed_dollar_traded"] = dollar_traded
+                                    target["day_volume"] = int(total_bar_vol)
+
+                                bar_high = float(h_sub.max())
+                                bar_low = float(l_sub.min())
+                                if bar_high > target.get("day_high", 0):
+                                    target["day_high"] = bar_high
+                                if bar_low > 0 and (target.get("day_low", 0) <= 0 or bar_low < target["day_low"]):
+                                    target["day_low"] = bar_low
+
+                                # Cumulative VWAP curve across all 1-minute bars
+                                running_vwap = np.where(cum_v > 0, cum_d / cum_v, typ_p)
+                                running_vwap = pd.Series(running_vwap, index=common_idx)
+
+                                dist_low_series = ((l_sub - running_vwap) / running_vwap) * 100.0
+                                dist_close_series = ((c_sub - running_vwap) / running_vwap) * 100.0
+
+                                # Seed true historical session-low VWAP distance
+                                valid_low_dists = dist_low_series.dropna()
+                                if not valid_low_dists.empty:
+                                    target["session_low_vwap_distance"] = float(valid_low_dists.min())
+
+                                # Replay dip qualification across 1-minute bars
+                                dipped_flag = False
+                                last_dip_time = 0.0
+
+                                for idx, bar_dt in enumerate(common_idx):
+                                    if getattr(bar_dt, "tzinfo", None) is not None:
+                                        bar_ts = bar_dt.timestamp()
+                                    else:
+                                        bar_ts = pd.to_datetime(bar_dt).tz_localize("America/New_York").timestamp()
+
+                                    d_low = dist_low_series.iloc[idx]
+                                    d_close = dist_close_series.iloc[idx]
+
+                                    if pd.isna(d_low) or pd.isna(d_close):
+                                        continue
+
+                                    if (-2.5 <= d_close <= -0.2) or (-2.5 <= d_low <= -0.2):
+                                        dipped_flag = True
+                                        last_dip_time = bar_ts
+                                    elif d_close < -3.0 or d_close > 1.5:
+                                        dipped_flag = False
+
+                                # Check dip expiration against current system time (max 30 mins)
+                                if dipped_flag and (current_unix - last_dip_time) <= MAX_DIP_AGE_SECONDS:
+                                    target["dipped_below_vwap"] = True
+                                    target["dipped_below_vwap_time"] = last_dip_time
+                                else:
+                                    target["dipped_below_vwap"] = False
+                                    target["dipped_below_vwap_time"] = 0.0
+
+            except Exception as e:
+                print(f"  [WARN] Failed downloading 1m bars for VWAP seeding: {e}")
+
         print(f"Qualified & Scored {len(fully_scored_candidates)} aligned targets (ADR >= {MIN_ADR_PCT}% or Catalyst). Selected top {len(top_40)} for WebSocket.")
         if top_40:
             print(f"  [TOP PICK] {top_40[0]['finnhub_symbol']} | Score: {top_40[0]['morning_setup_score']:.1f} ({top_40[0]['morning_setup_class']}) | "
@@ -781,11 +882,11 @@ def register_symbol_in_memory(target: dict, force_update: bool = False):
                 "reject_count": 0,
                 "near_hod_streak": 0,
                 "last_alert_time": 0,  
-                "dipped_below_vwap": False,  
-                "dipped_below_vwap_time": 0,
+                "dipped_below_vwap": target.get("dipped_below_vwap", False),  
+                "dipped_below_vwap_time": target.get("dipped_below_vwap_time", 0.0),
                 "last_reclaim_alert_time": 0,  
                 "session_low_price": seed_session_low_price,
-                "session_low_vwap_distance": None,  
+                "session_low_vwap_distance": target.get("session_low_vwap_distance", None),  
                 "reclaim_streak": 0,
                 "last_pullback_alert_time": 0,
                 "last_breakout_alert_time": 0,
@@ -1080,7 +1181,7 @@ def evaluation_loop():
                     # ==============================================================
                     # EXECUTION GATE 2: VWAP CONTINUATION (Threshold <= 0.4%)
                     # ==============================================================
-                    elif (p_change >= 8.0 and 
+                    elif (#p_change >= 6.0 and 
                           upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target) and 
                           -0.5 <= vwap_distance <= 0.4 and 
                           order_flow_delta_pct >= 15.0 and
@@ -1138,12 +1239,12 @@ def evaluation_loop():
                           p_change >= 6.0 and
                           distance_to_hod_pct <= 1.5 and
                           intraday_clv_pct >= 80.0 and
-                          metrics["adr_pct"] >= 7.5 and
+                          metrics["adr_pct"] >= 1 and
                           vol_progress_pct >= 150.0 and
                           live_rvol >= 2.0 and
                           order_flow_delta_pct >= 20.0 and
                           alignment == "FULL_BULLISH" and
-                          current_price > avg_price and
+                          current_price >= avg_price and
                           not is_over_extended and
                           not overnight_in_cooldown):
 
@@ -1312,13 +1413,32 @@ def on_message(ws, message):
                         # Reset reject counter on valid print or confirmed rebase
                         m["reject_count"] = 0
 
-                        # Update state
+                        # Update price and cumulative dollar volume
                         m["current_price"] = price
                         m["cumulative_volume"] += vol
                         m["total_dollar_traded"] += (price * vol)
 
                         if price > m["high_of_day_price"]:
                             m["high_of_day_price"] = price
+
+                        # Capture true flush wick extremes on every tick
+                        if m["session_low_price"] <= 0 or price < m["session_low_price"]:
+                            m["session_low_price"] = price
+
+                        # Tick-accurate live VWAP and session-low VWAP distance
+                        if m["cumulative_volume"] > 0:
+                            live_vwap = m["total_dollar_traded"] / m["cumulative_volume"]
+                            tick_vwap_dist = ((price - live_vwap) / live_vwap) * 100.0
+
+                            if m["session_low_vwap_distance"] is None or tick_vwap_dist < m["session_low_vwap_distance"]:
+                                m["session_low_vwap_distance"] = tick_vwap_dist
+
+                            # Real-time tick-accurate dip registration
+                            if -2.5 <= tick_vwap_dist <= -0.2:
+                                m["dipped_below_vwap"] = True
+                                m["dipped_below_vwap_time"] = time.time()
+                            elif tick_vwap_dist < -3.0 or tick_vwap_dist > 1.5:
+                                m["dipped_below_vwap"] = False
 
                         # Stateful Lee-Ready Tick Rule (Direction Persistence for Flat Ticks)
                         if prev_tick > 0 and not is_rebase:
