@@ -134,10 +134,10 @@ def calculate_relative_volume(day_volume: float, avg_vol_3m: float) -> float | N
     else:
         elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
 
-    # Quadratic approximation of institutional U-curve volume progression
     t = elapsed_minutes / session_minutes
-    expected_fraction = (0.35 * t) + (0.65 * (t ** 2.2))
-    expected_fraction = max(0.01, min(1.0, expected_fraction))
+    # Front-loaded institutional U-curve: heavy morning volume, flat midday, acceleration into close
+    expected_fraction = 0.25 * np.sqrt(t) + 0.50 * t + 0.25 * (t ** 3)
+    expected_fraction = max(0.01, min(1.0, float(expected_fraction)))
 
     expected_volume = avg_vol_3m * expected_fraction
     return round(day_volume / expected_volume, 2) if expected_volume > 0 else None
@@ -205,7 +205,7 @@ def calculate_trade_levels(
 ) -> dict | None:
     """
     Deterministic institutional execution engine featuring empirical volatility,
-    catalyst volatility expansion, dynamic volume fuel factor scaling,
+    catalyst volatility expansion, volume fuel factor scaling anchored to live RVOL,
     structural stop-loss integrity, and safe wall penetration logic.
     """
     day_range_pct = ((hod_price - session_low_price) / session_low_price * 100.0) if session_low_price > 0 else 0.0
@@ -219,8 +219,8 @@ def calculate_trade_levels(
     eff_hod = max(hod_price, current_price)
     eff_atr_dollars = atr_14 if atr_14 > 0.0 else (current_price * (eff_adr / 100.0))
 
-    # Compute Volume Fuel Factor (square-root dampener clamped to [0.55, 1.65])
-    vol_fuel_factor = max(0.55, min(1.65, float(np.sqrt(max(0.01, remaining_vol_ratio)))))
+    # Compute Volume Fuel Factor anchored to live RVOL pacing to prevent afternoon decay collapse
+    vol_fuel_factor = max(0.55, min(1.65, float(np.sqrt(max(0.01, live_rvol)))))
 
     # Volume Exhaustion Protection: clamp expansion if excessive turnover occurs with weak delta
     is_exhaustion_churn = (vol_progress_pct >= 350.0 and order_flow_delta_pct < 20.0)
@@ -243,6 +243,9 @@ def calculate_trade_levels(
             raw_tp2 = entry + ((raw_tp2 - entry) * 0.70)
 
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.0:
+            tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
+
         tp1 = round(entry + 0.55 * (tp2 - entry), 2)
 
     # Gate 1 Alignment Check (-0.5% to +0.6% from VWAP)
@@ -258,8 +261,7 @@ def calculate_trade_levels(
             raw_tp2 = max(raw_tp2, eff_hod * (1.0 + (eff_adr / 100.0) * 0.15))
 
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        # Safe barrier clearance: guarantees >= 6.0% gain without integer truncation drops
-        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.0:
             tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
@@ -273,6 +275,9 @@ def calculate_trade_levels(
 
         raw_tp2 = min(eff_hod, max_realistic_reach)
         tp2 = adjust_for_whole_dollar(max(raw_tp2, avg_price * 1.02), entry)
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.0:
+            tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
+
         raw_tp1 = min(max(avg_price, entry * 1.025), entry + 0.65 * (tp2 - entry))
         tp1 = adjust_for_whole_dollar(raw_tp1, entry)
 
@@ -282,12 +287,12 @@ def calculate_trade_levels(
         atr_stop = entry - (eff_atr_dollars * 0.25)
         sl = round(max(entry * 0.972, min(entry * 0.985, atr_stop)), 2)
 
-        expansion_pct = max(MIN_TARGET_GAIN_PCT, eff_adr * (0.35 * vol_fuel_factor))
+        # Baseline expansion padded so that post-clipping target retains >= 6.0%
+        expansion_pct = max(MIN_TARGET_GAIN_PCT + 1.2, eff_adr * (0.35 * vol_fuel_factor))
         raw_tp2 = entry * (1.0 + (expansion_pct / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
 
-        # Safe barrier clearance: guarantees >= 6.0% gain without integer truncation drops
-        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.0:
             tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
@@ -298,10 +303,10 @@ def calculate_trade_levels(
         hard_stop = round(entry * 0.968, 2)  # -3.2% max risk limit
         sl = max(vwap_stop, hard_stop)
 
-        target_gain_pct = max(MIN_TARGET_GAIN_PCT, eff_adr * 0.65 * vol_fuel_factor)
+        target_gain_pct = max(MIN_TARGET_GAIN_PCT + 1.2, eff_adr * 0.65 * vol_fuel_factor)
         raw_tp2 = entry * (1.0 + (target_gain_pct / 100.0))
         tp2 = adjust_for_whole_dollar(raw_tp2, entry)
-        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.20:
+        if ((tp2 - entry) / entry * 100.0) < MIN_TARGET_GAIN_PCT and vol_fuel_factor >= 1.0:
             tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0) * 1.05), 2)
 
         tp1 = round(entry + 0.50 * (tp2 - entry), 2)
@@ -405,7 +410,8 @@ def score_intraday_setup(
 
     rvol_val = live_rvol if (live_rvol and live_rvol > 0) else (metrics.get("relative_volume") or 1.0)
     score += min(rvol_val, 10.0) * 2.0
-    score += (max(intraday_clv_pct, 0.0) / 100.0) * 15.0
+    # Clean 0% to 100% intraday position mapping to [0, 15] points
+    score += (max(0.0, min(100.0, intraday_clv_pct)) / 100.0) * 15.0
 
     trend_7d = metrics.get("trend_7d", "Neutral")
     if trend_7d == "Bullish":
@@ -731,10 +737,10 @@ def get_morning_watchlist() -> list[dict]:
         return []
 
 
-def register_symbol_in_memory(target: dict):
+def register_symbol_in_memory(target: dict, force_update: bool = False):
     sym = target["finnhub_symbol"]
     with data_lock:
-        if sym not in market_data:
+        if sym not in market_data or force_update:
             seed_price = target.get("regularMarketPrice", 0)
             day_low = target.get("day_low", 0)
             seed_session_low_price = day_low if (day_low and day_low > 0 and day_low <= seed_price) else seed_price
@@ -813,7 +819,7 @@ def evaluation_loop():
                 refreshed_targets = get_morning_watchlist()
                 with data_lock:
                     for target in refreshed_targets:
-                        register_symbol_in_memory(target)
+                        register_symbol_in_memory(target, force_update=True)
             except Exception as e:
                 print(f"  [RESET WARN] Failed to re-seed session: {e}")
             last_session_date = current_date
@@ -833,7 +839,10 @@ def evaluation_loop():
         session_minutes = 390.0
         elapsed_minutes = max(1.0, (now_et - market_open).total_seconds() / 60.0)
         t_session = min(1.0, elapsed_minutes / session_minutes)
-        remaining_session_fraction = max(0.0, 1.0 - t_session)
+
+        # Non-linear cumulative curve expected progress
+        curve_progress = 0.25 * np.sqrt(t_session) + 0.50 * t_session + 0.25 * (t_session ** 3)
+        remaining_session_fraction = max(0.0, 1.0 - curve_progress)
 
         # Power Hour Evaluation Window (15:15 to 15:58 ET)
         is_power_hour = (now_et.hour == 15 and 15 <= now_et.minute <= 58)
@@ -930,10 +939,11 @@ def evaluation_loop():
                     if metrics["session_low_price"] > 0:
                         distance_from_low_pct = ((current_price - metrics["session_low_price"]) / metrics["session_low_price"]) * 100.0
 
+                    # Clean 0% to 100% position within daily range
                     day_spread = hod_price - metrics["session_low_price"]
                     intraday_clv_pct = 0.0
                     if day_spread > 0:
-                        intraday_clv_pct = (((current_price - metrics["session_low_price"]) - (hod_price - current_price)) / day_spread) * 100.0
+                        intraday_clv_pct = ((current_price - metrics["session_low_price"]) / day_spread) * 100.0
 
                     open_p = metrics.get("open_price", current_price)
                     intraday_return_pct = ((current_price - open_p) / open_p * 100.0) if open_p > 0 else 0.0
@@ -1105,7 +1115,7 @@ def evaluation_loop():
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
                           order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
                           vol_progress_pct >= 40.0 and
-                          remaining_session_fraction >= 0.25 and
+                          remaining_session_fraction >= 0.20 and
                           projected_remaining_vol >= 250_000 and
                           not pullback_in_cooldown):
 
