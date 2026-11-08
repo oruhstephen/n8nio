@@ -217,7 +217,13 @@ def calculate_trade_levels(
         return None
 
     eff_hod = max(hod_price, current_price)
-    eff_atr_dollars = atr_14 if atr_14 > 0.0 else (current_price * (eff_adr / 100.0))
+
+    # Scale effective ATR dollars with realized range on catalyst days
+    if is_active_catalyst:
+        catalyst_atr_dollars = current_price * (eff_adr / 100.0) * 0.35
+        eff_atr_dollars = max(atr_14, catalyst_atr_dollars)
+    else:
+        eff_atr_dollars = atr_14 if atr_14 > 0.0 else (current_price * (eff_adr / 100.0))
 
     # Compute Volume Fuel Factor anchored to live RVOL pacing to prevent afternoon decay collapse
     vol_fuel_factor = max(0.55, min(1.65, float(np.sqrt(max(0.01, live_rvol)))))
@@ -747,9 +753,16 @@ def get_morning_watchlist() -> list[dict]:
                     v_1m = extract_series(bars_1m, 'Volume', sym)
 
                     if c_1m is not None and h_1m is not None and l_1m is not None and v_1m is not None and len(c_1m) > 0:
-                        common_idx = c_1m.index.intersection(h_1m.index).intersection(l_1m.index).intersection(v_1m.index)
+                        raw_idx = c_1m.index.intersection(h_1m.index).intersection(l_1m.index).intersection(v_1m.index).sort_values()
+                        
+                        # Strict date check: Exclude yesterday's bars when running pre-market or during weekends
+                        common_idx = [
+                            dt for dt in raw_idx 
+                            if (dt.tz_convert("America/New_York").date() if getattr(dt, "tzinfo", None) is not None else pd.to_datetime(dt).date()) == today_et
+                        ]
+
                         if len(common_idx) > 0:
-                            common_idx = common_idx.sort_values()
+                            common_idx = pd.DatetimeIndex(common_idx)
                             h_sub = h_1m.loc[common_idx]
                             l_sub = l_1m.loc[common_idx]
                             c_sub = c_1m.loc[common_idx]
@@ -899,8 +912,13 @@ def register_symbol_in_memory(target: dict, force_update: bool = False):
 # ==========================================
 def evaluation_loop():
     print("--- [THREAD] Independent 60-Second Evaluation Loop Started ---")
-    # Initialize with current ET date so midday startups do not wipe seeded volume
-    last_session_date = datetime.now(ZoneInfo("America/New_York")).date()
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    current_date = now_et.date()
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # If started after market open, session is marked active; if pre-market, it waits for 09:30 ET
+    session_opened_today = (now_et >= market_open)
+    last_session_date = current_date
 
     while True:
         time.sleep(60)
@@ -913,17 +931,26 @@ def evaluation_loop():
         market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
 
-        # Multi-day daemon state reset at 09:30 ET: Re-seed from fresh morning watchlist
-        if last_session_date != current_date and now_et >= market_open:
-            print(f"\n--- [SESSION RESET] Re-seeding intraday market state for {current_date} ---")
+        # Midnight rollover reset
+        if current_date != last_session_date:
+            session_opened_today = False
+            last_session_date = current_date
+
+        # Multi-day daemon state reset at 09:30 ET: Re-seed from fresh morning watchlist & re-subscribe WS
+        if now_et >= market_open and not session_opened_today:
+            print(f"\n--- [SESSION RESET] Market open reached: Re-seeding state for {current_date} ---")
             try:
                 refreshed_targets = get_morning_watchlist()
                 with data_lock:
                     for target in refreshed_targets:
                         register_symbol_in_memory(target, force_update=True)
+                    symbols_to_sub = list(market_data.keys())
+                for sym in symbols_to_sub:
+                    send_ws_message({"type": "subscribe", "symbol": sym})
+                    time.sleep(0.02)
             except Exception as e:
                 print(f"  [RESET WARN] Failed to re-seed session: {e}")
-            last_session_date = current_date
+            session_opened_today = True
 
         # Guard: Restrict execution gate logic strictly to regular market hours
         is_market_session = (market_open <= now_et < market_close)
@@ -1181,7 +1208,7 @@ def evaluation_loop():
                     # ==============================================================
                     # EXECUTION GATE 2: VWAP CONTINUATION (Threshold <= 0.4%)
                     # ==============================================================
-                    elif (#p_change >= 6.0 and 
+                    elif (p_change >= 6.0 and 
                           upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target) and 
                           -0.5 <= vwap_distance <= 0.4 and 
                           order_flow_delta_pct >= 15.0 and
@@ -1239,7 +1266,7 @@ def evaluation_loop():
                           p_change >= 6.0 and
                           distance_to_hod_pct <= 1.5 and
                           intraday_clv_pct >= 80.0 and
-                          metrics["adr_pct"] >= 1 and
+                          metrics["adr_pct"] >= 1.0 and
                           vol_progress_pct >= 150.0 and
                           live_rvol >= 2.0 and
                           order_flow_delta_pct >= 20.0 and
@@ -1307,8 +1334,23 @@ def evaluation_loop():
             }
 
             def post_webhook(p):
+                def numpy_serializer(obj):
+                    if isinstance(obj, (np.integer, np.int64, np.int32)):
+                        return int(obj)
+                    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                        return float(obj)
+                    elif isinstance(obj, (np.bool_, bool)):
+                        return bool(obj)
+                    return str(obj)
+
                 try:
-                    resp = requests.post(N8N_WEBHOOK_URL, json=p, timeout=5)
+                    payload_json = json.dumps(p, default=numpy_serializer)
+                    resp = requests.post(
+                        N8N_WEBHOOK_URL, 
+                        data=payload_json, 
+                        headers={"Content-Type": "application/json"}, 
+                        timeout=5
+                    )
                     if resp.status_code >= 400:
                         print(f"  [WEBHOOK ERR] n8n returned HTTP {resp.status_code}: {resp.text}")
                 except Exception as ex:
