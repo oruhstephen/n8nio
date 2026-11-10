@@ -1041,7 +1041,7 @@ def evaluation_loop():
 
                     if is_bouncing:
                         metrics["reclaim_streak"] += 1
-                    else:
+                    elif current_price < price_60s_ago:
                         metrics["reclaim_streak"] = 0
 
                     session_low_depth = abs(session_low_vwap_dist) if (session_low_vwap_dist and session_low_vwap_dist < 0) else 0.0
@@ -1317,6 +1317,15 @@ def evaluation_loop():
                             )
 
                 metrics["price_60s_ago"] = current_price
+
+        # Add this inside evaluation_loop for any stock up >= 5% that fails to trigger:
+        if p_change >= 5.0 and not triggered_symbols:
+            if total_tick_vol < MIN_1M_ORDER_FLOW_VOLUME:
+                print(f"  [GATE WAIT] {sym}: Low 60s tick volume ({total_tick_vol} < {MIN_1M_ORDER_FLOW_VOLUME})")
+            elif metrics["reclaim_streak"] < RECLAIM_MIN_STREAK:
+                print(f"  [GATE WAIT] {sym}: Reclaim streak too low ({metrics['reclaim_streak']} < {RECLAIM_MIN_STREAK})")
+            elif not has_adr_fuel:
+                print(f"  [GATE WAIT] {sym}: ADR exhausted ({adr_exhaustion_ratio:.2f} > 1.35)")
 
         # Print all lines sorted by setup_score descending
         if log_entries:
