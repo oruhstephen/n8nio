@@ -615,51 +615,119 @@ def run_macro_analysis():
             # ==============================================================
             # STRATEGY 3: OVERNIGHT GAP & BREAKOUT
             # ==============================================================
+            # ==============================================================
+            # STRATEGY 3: OVERNIGHT GAP ANTICIPATION (EOD IGNITION)
+            # Screens during the final 45 mins of market hours (15:15-15:58 ET)
+            # for stocks structurally primed to gap up at tomorrow's open.
+            # ==============================================================
             if not pending_earnings and not is_recent_gap:
-                if today_change_pct >= GAP_MIN_DAY_PCT:
-                    if rvol >= GAP_MIN_RVOL and close_range_position >= GAP_MIN_CLOSE_RANGE:
-                        if is_fresh_breakout:
-                            raw_stop = current_price - (GAP_ATR_STOP_MULT * atr_val)
-                            stop_loss_gap = adjust_for_whole_dollar(raw_stop, current_price, is_stop=True)
-                            risk_per_share = max(0.01, current_price - stop_loss_gap)
-                            risk_pct_gap = (risk_per_share / current_price) * 100.0
+                
+                # --- 1. MICROSTRUCTURE & AUCTION METRICS ---
+                day_spread = high_today - low_today
+                intraday_clv_pct = ((current_price - low_today) / day_spread * 100.0) if day_spread > 0 else 50.0
+                distance_to_hod_pct = ((high_today - current_price) / current_price * 100.0) if current_price > 0 else 0.0
 
-                            expansion_pct = max(MIN_TARGET_GAIN_PCT, adr_pct * 0.85 * vol_fuel_factor)
-                            raw_target = current_price * (1.0 + (expansion_pct / 100.0))
-                            target_gap = adjust_for_whole_dollar(raw_target, current_price)
-                            est_gain_pct = ((target_gap - current_price) / current_price) * 100.0
-                            rr_ratio = round((target_gap - current_price) / risk_per_share, 2)
+                # Derive Order Flow Delta from 1m bars (or tick estimator)
+                # Compares volume on up-bars (close >= open) vs down-bars (close < open) in the EOD window
+                order_flow_delta_pct = 0.0
+                try:
+                    # Extracts 1m intraday bars for the current session
+                    bars_1m_sym = extract_series(bars_1m, 'Close', sym)
+                    if bars_1m_sym is not None and len(bars_1m_sym) >= 30:
+                        c_sub = extract_series(bars_1m, 'Close', sym).tail(30)
+                        o_sub = extract_series(bars_1m, 'Open', sym).tail(30)
+                        v_sub = extract_series(bars_1m, 'Volume', sym).tail(30)
+                        
+                        buy_vol = v_sub[c_sub >= o_sub].sum()
+                        sell_vol = v_sub[c_sub < o_sub].sum()
+                        total_window_vol = buy_vol + sell_vol
+                        
+                        if total_window_vol > 0:
+                            order_flow_delta_pct = ((buy_vol - sell_vol) / total_window_vol) * 100.0
+                except Exception:
+                    # Fallback to daily candle proxy if 1m feed is unavailable
+                    order_flow_delta_pct = (intraday_clv_pct - 50.0) * 0.8
 
-                            target_vs_adr, adr_feasibility = evaluate_adr_feasibility(est_gain_pct, adr_pct)
+                # ADR Exhaustion Ratio & Catalyst Override
+                day_range_pct = (day_spread / low_today * 100.0) if low_today > 0 else 0.0
+                adr_exhaustion_ratio = (day_range_pct / adr_pct) if adr_pct > 0 else 1.0
+                has_adr_fuel = (adr_exhaustion_ratio <= 1.35) or (rvol >= 3.0)
 
-                            score, s_class = score_swing_setup(
-                                "BUY_GAP_BREAKOUT", trend_alignment, rvol, adx_val, rsi_val,
-                                ret_7d, green_days_5d, adr_pct, ext_50, rr_ratio
-                            )
-                            gap_setups.append({
-                                "symbol": sym,
-                                "company_name": company_name,
-                                "action": "BUY_GAP_BREAKOUT",
-                                "setup_score": score,
-                                "setup_class": s_class,
-                                "market_cap_tier": get_mcap_tier(mcap),
-                                "trend_alignment": trend_alignment,
-                                "signal_timestamp": scan_timestamp,
-                                "current_price": round(current_price, 2),
-                                "target_price": target_gap,
-                                "estimated_gain_pct": round(est_gain_pct, 2),
-                                "recommended_stop_loss": stop_loss_gap,
-                                "risk_pct": round(risk_pct_gap, 2),
-                                "reward_risk_ratio": rr_ratio,
-                                "adr_pct": round(adr_pct, 2),
-                                "target_vs_adr_pct": target_vs_adr,
-                                "adr_feasibility": adr_feasibility,
-                                "volume_fuel_factor": round(vol_fuel_factor, 2),
-                                "rvol": rvol,
-                                "close_range_position_pct": round(close_range_position * 100, 1),
-                                "daily_rsi": round(rsi_val, 1),
-                                "adx_strength": round(adx_val, 2)
-                            })
+                # --- 2. THE UNIFIED OVERNIGHT GAP GATING CONDITIONS ---
+                is_gap_anticipation = (
+                    trend_alignment == "Bullish" and              # Full EMA/SMA bullish stack
+                    current_price > ema_8_val and                 # Riding fastest trend guide
+                    intraday_clv_pct >= 85.0 and                  # Pinned in top 15% of day's range
+                    distance_to_hod_pct <= 1.5 and                # Imminent or breaking HOD
+                    order_flow_delta_pct >= 20.0 and              # Aggressive net buyer delta
+                    rvol >= 2.0 and                               # Heavy institutional sponsorship
+                    vol_fuel_factor >= 1.40 and                   # Volume fuel confirms velocity
+                    adr_pct >= 1.2 and                            # Sufficient baseline daily range
+                    has_adr_fuel and                              # Unexhausted range or catalyst expansion
+                    today_change_pct >= 2.5 and                   # Decisive green day
+                    current_price >= vwap_20d                     # Above rolling baseline
+                )
+
+                if is_gap_anticipation:
+                    # --- 3. RISK ENGINE & TARGET PROJECTION ---
+                    # Stop is anchored to the intraday support floor / 8-EMA
+                    structural_stop = max(low_today, ema_8_val - (0.35 * atr_val))
+                    hard_risk_floor = current_price * (1.0 - (MAX_STOP_LOSS_PCT / 100.0))
+                    raw_stop = max(structural_stop, hard_risk_floor)
+                    stop_loss_gap = adjust_for_whole_dollar(raw_stop, current_price, is_stop=True)
+
+                    risk_per_share = max(0.01, current_price - stop_loss_gap)
+                    risk_pct_gap = (risk_per_share / current_price) * 100.0
+
+                    # Target projects expected opening gap expansion scaled by ADR and Volume Fuel
+                    projected_gap_expansion_pct = max(MIN_TARGET_GAIN_PCT, adr_pct * 0.75 * vol_fuel_factor)
+                    raw_target = current_price * (1.0 + (projected_gap_expansion_pct / 100.0))
+                    target_gap = adjust_for_whole_dollar(raw_target, current_price)
+
+                    est_gain_pct = ((target_gap - current_price) / current_price) * 100.0
+                    rr_ratio = round((target_gap - current_price) / risk_per_share, 2)
+
+                    target_vs_adr, adr_feasibility = evaluate_adr_feasibility(est_gain_pct, adr_pct)
+
+                    # --- 4. QUALIFICATION & INSTITUTIONAL SCORING ---
+                    if risk_pct_gap <= MAX_STOP_LOSS_PCT and rr_ratio >= MIN_REWARD_RISK_RATIO:
+                        score, s_class = score_swing_setup(
+                            "BUY_GAP_ANTICIPATION", trend_alignment, rvol, adx_val, rsi_val,
+                            ret_7d, green_days_5d, adr_pct, ext_50, rr_ratio
+                        )
+                        
+                        # Add conviction points for extreme CLV and order flow delta
+                        if intraday_clv_pct >= 92.0: score = min(100.0, score + 6.0)
+                        if order_flow_delta_pct >= 35.0: score = min(100.0, score + 6.0)
+
+                        gap_setups.append({
+                            "symbol": sym,
+                            "company_name": company_name,
+                            "action": "BUY_GAP_ANTICIPATION",
+                            "setup_score": score,
+                            "setup_class": s_class,
+                            "market_cap_tier": get_mcap_tier(mcap),
+                            "trend_alignment": trend_alignment,
+                            "signal_timestamp": scan_timestamp,
+                            "current_price": round(current_price, 2),
+                            "target_price": target_gap,
+                            "estimated_gain_pct": round(est_gain_pct, 2),
+                            "recommended_stop_loss": stop_loss_gap,
+                            "risk_pct": round(risk_pct_gap, 2),
+                            "reward_risk_ratio": rr_ratio,
+                            "intraday_clv_pct": round(intraday_clv_pct, 1),
+                            "distance_to_hod_pct": round(distance_to_hod_pct, 2),
+                            "order_flow_delta_pct": round(order_flow_delta_pct, 1),
+                            "rvol": rvol,
+                            "volume_fuel_factor": round(vol_fuel_factor, 2),
+                            "adr_pct": round(adr_pct, 2),
+                            "target_vs_adr_pct": target_vs_adr,
+                            "adr_feasibility": adr_feasibility,
+                            "daily_rsi": round(rsi_val, 1),
+                            "adx_strength": round(adx_val, 2),
+                            "ema_8": round(ema_8_val, 2),
+                            "vwap_20d": round(vwap_20d, 2)
+                        })
 
         except Exception as e:
             continue
