@@ -1343,7 +1343,7 @@ def evaluation_loop():
                               live_rvol >= 2.0 and
                               order_flow_delta_pct >= 20.0 and
                               alignment == "FULL_BULLISH" and
-                              current_price >= avg_price and
+                              #current_price >= avg_price and
                               not is_over_extended and
                               not overnight_in_cooldown):
 
