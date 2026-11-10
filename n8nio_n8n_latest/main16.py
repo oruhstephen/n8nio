@@ -25,6 +25,10 @@ N8N_WEBHOOK_URL = os.getenv(
     "https://go90ng-n8n.eq7icp.easypanel.host/webhook/bcca44dc-8944-41a2-8d96-3c5eb1f159e9"
 )
 
+# Global execution constraint toggle
+# Set to False to decouple/disable TP/SL & target headroom blocks so signals fire freely on technical triggers
+ENFORCE_BRACKET_CONSTRAINTS = False
+
 # Prevent alert spamming: 15-minute (900 seconds) cooldown per ticker
 ALERT_COOLDOWN_SECONDS = 900
 
@@ -323,27 +327,28 @@ def calculate_trade_levels(
         tp1 = round(current_price * 1.03, 2)
         tp2 = round(current_price * 1.06, 2)
 
-    # Enforce structural stop integrity: reject outright if risk exceeds MAX_STOP_LOSS_PCT
-    min_sl_price = round(entry * (1.0 - (MAX_STOP_LOSS_PCT / 100.0)), 2)
-    if sl < min_sl_price:
-        return None
-
-    if sl >= entry or tp2 <= entry:
-        return None
+    # Sanity checks: ensure SL is below entry and TP2 is above entry
+    if sl >= entry:
+        sl = round(entry * (1.0 - (MAX_STOP_LOSS_PCT / 100.0)), 2)
+    if tp2 <= entry:
+        tp2 = round(entry * (1.0 + (MIN_TARGET_GAIN_PCT / 100.0)), 2)
 
     est_gain_tp2_pct = round(((tp2 - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
     est_gain_tp1_pct = round(((tp1 - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
-
-    # Strictly reject any setup that cannot deliver >= 6% gain on TP2
-    if est_gain_tp2_pct < MIN_TARGET_GAIN_PCT:
-        return None
 
     risk_per_share = max(0.01, entry - sl)
     reward_per_share = max(0.0, tp2 - entry)
     rr_ratio = round(reward_per_share / risk_per_share, 2)
 
-    if rr_ratio < MIN_REWARD_RISK_RATIO:
-        return None
+    # Hard risk/reward validation gate controlled by the global toggle
+    if ENFORCE_BRACKET_CONSTRAINTS:
+        min_sl_price = round(entry * (1.0 - (MAX_STOP_LOSS_PCT / 100.0)), 2)
+        if sl < min_sl_price:
+            return None
+        if est_gain_tp2_pct < MIN_TARGET_GAIN_PCT:
+            return None
+        if rr_ratio < MIN_REWARD_RISK_RATIO:
+            return None
 
     return {
         "target_entry_price": entry,
@@ -1023,7 +1028,7 @@ def evaluation_loop():
                         if cents_away <= 0.05:
                             is_converging = True
 
-                    is_bouncing = current_price > price_60s_ago  
+                    is_bouncing = current_price >= price_60s_ago  
                     
                     extension_pct = 0.0
                     is_over_extended = False
@@ -1039,7 +1044,7 @@ def evaluation_loop():
                     if current_price < metrics["session_low_price"]:
                         metrics["session_low_price"] = current_price
 
-                    if is_bouncing:
+                    if current_price > price_60s_ago:
                         metrics["reclaim_streak"] += 1
                     elif current_price < price_60s_ago:
                         metrics["reclaim_streak"] = 0
@@ -1183,7 +1188,7 @@ def evaluation_loop():
                     if (metrics["dipped_below_vwap"] and
                         alignment in ("FULL_BULLISH", "COMPRESSION") and  
                         -0.5 <= vwap_distance <= 0.6 and
-                        distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
+                        (not ENFORCE_BRACKET_CONSTRAINTS or distance_to_hod_pct >= MIN_TARGET_GAIN_PCT) and
                         has_adr_fuel and
                         is_bouncing and
                         metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
@@ -1209,7 +1214,7 @@ def evaluation_loop():
                     # EXECUTION GATE 2: VWAP CONTINUATION (Threshold <= 0.4%)
                     # ==============================================================
                     elif (p_change >= 6.0 and 
-                          upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target) and 
+                          (not ENFORCE_BRACKET_CONSTRAINTS or upside_potential >= max(MIN_TARGET_GAIN_PCT, dynamic_target)) and 
                           -0.5 <= vwap_distance <= 0.4 and 
                           order_flow_delta_pct >= 15.0 and
                           live_rvol >= 2.0 and
@@ -1238,7 +1243,7 @@ def evaluation_loop():
                           alignment in ("FULL_BULLISH", "COMPRESSION") and  
                           cum_vol >= 100000 and rvol_ok and
                           vwap_distance <= -2.5 and 
-                          distance_to_hod_pct >= MIN_TARGET_GAIN_PCT and
+                          (not ENFORCE_BRACKET_CONSTRAINTS or distance_to_hod_pct >= MIN_TARGET_GAIN_PCT) and
                           distance_from_low_pct >= 1.0 and 
                           metrics["reclaim_streak"] >= RECLAIM_MIN_STREAK and
                           order_flow_delta_pct >= pullback_tier["min_order_flow_delta_pct"] and
