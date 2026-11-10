@@ -27,10 +27,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER UNIVERSE CONSTRAINTS ---
-MIN_MARKET_CAP = 500_000_000         # $500M minimum capitalization
-MIN_AVG_VOLUME = 250_000             # Minimum 3-month average liquidity
-MIN_PRICE = 10.00                    # Eliminates penny stock microstructure noise
-UNIVERSE_SIZE = 1500                 # Screen depth
+MIN_MARKET_CAP = 250_000_000         # $500M minimum capitalization
+MIN_AVG_VOLUME = 1_000_000             # Minimum 3-month average liquidity
+MIN_PRICE = 1.00                    # Eliminates penny stock microstructure noise
+UNIVERSE_SIZE = 1250                 # Screen depth
 PAGE_SIZE = 250
 
 # --- BENCHMARK ETFS ---
@@ -61,7 +61,7 @@ GAP_MIN_DAY_PCT = 3.0                # Minimum % expansion
 GAP_ATR_STOP_MULT = 0.5
 
 # --- SYSTEM HYGIENE & COOLDOWNS ---
-EARNINGS_BLACKOUT_DAYS = 7           # Skip stocks with earnings within 7 days
+EARNINGS_BLACKOUT_DAYS = 0           # Skip stocks with earnings within 7 days
 DEDUP_WINDOW_DAYS = 21               # Prevent alert spamming for 21 days
 MAX_ATR_GAP_MULTIPLIER = 1.5         # Drop gaps larger than 1.5x daily ATR
 
