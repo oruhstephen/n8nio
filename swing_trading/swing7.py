@@ -27,7 +27,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_SYMBOLS_FILE = os.path.join(DATA_DIR, "seen_symbols.json")
 
 # --- SCREENER UNIVERSE CONSTRAINTS ---
-MIN_MARKET_CAP = 250_000_000         # $500M minimum capitalization
+MIN_MARKET_CAP = 60_000_000         # $500M minimum capitalization
 MIN_AVG_VOLUME = 1_000_000             # Minimum 3-month average liquidity
 MIN_PRICE = 1.00                    # Eliminates penny stock microstructure noise
 UNIVERSE_SIZE = 1250                 # Screener depth
